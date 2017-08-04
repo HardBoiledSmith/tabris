@@ -1,0 +1,2 @@
+git-2.7.5-1.49.amzn1
+python35-pip-6.1.1-1.23.amzn1
