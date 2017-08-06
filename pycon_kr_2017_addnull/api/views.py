@@ -1,5 +1,6 @@
 from django.conf.urls import url
 from rest_framework import serializers
+from rest_framework import status
 from rest_framework import viewsets
 from rest_framework.response import Response
 
@@ -34,7 +35,14 @@ class ViewSet(viewsets.ViewSet):
         start = serializer.data['start']
         end = serializer.data['end']
 
-        data = list(range(start, end))
+        if start > end:
+            data = dict()
+            data['message'] = '\'start\' cannot be greater than \'end\'.'
+            response = Response(status=status.HTTP_400_BAD_REQUEST, data=data)
+            return response
+
+        data = dict()
+        data['contents'] = list(range(start, end))
 
         response = Response(data=data)
 
