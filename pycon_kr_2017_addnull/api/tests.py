@@ -11,10 +11,10 @@ class APITest(APITestCase):
         pass
 
     def test_00(self):
-        url = '/numbers/'
+        path = '/numbers/'
         data = dict()
-        data['start'] = fuzzy.FuzzyInteger(100)
-        data['end'] = fuzzy.FuzzyInteger(100)
+        data['start'] = fuzzy.FuzzyInteger(100).fuzz()
+        data['end'] = fuzzy.FuzzyInteger(100).fuzz()
 
-        response = self.client.get(url)
+        response = self.client.get(path, data)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
