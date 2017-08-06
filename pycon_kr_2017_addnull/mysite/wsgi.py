@@ -1,5 +1,5 @@
 """
-WSGI config for mysite project.
+WSGI config for pycon_kr_2017_addnull project.
 
 It exposes the WSGI callable as a module-level variable named ``application``.
 
@@ -11,6 +11,6 @@ import os
 
 from django.core.wsgi import get_wsgi_application
 
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "mysite.settings")
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "pycon_kr_2017_addnull.settings")
 
 application = get_wsgi_application()
