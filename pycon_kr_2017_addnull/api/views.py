@@ -7,7 +7,7 @@ from rest_framework.response import Response
 
 def get_urlpatterns():
     as_view = ViewSet.as_view({
-        'get': 'list',
+        'get': 'get_numbers',
     })
 
     return [
@@ -28,7 +28,7 @@ class Serializer(serializers.Serializer):
 
 class ViewSet(viewsets.ViewSet):
     @staticmethod
-    def list(request):
+    def get_numbers(request):
         serializer = Serializer(data=request.query_params)
         serializer.is_valid(raise_exception=True)
 
