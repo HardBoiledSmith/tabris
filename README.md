@@ -97,7 +97,7 @@ vagrant up
 ### ④ 상태 확인
 ```bash
 vagrant ssh -c 'sudo systemctl status tabris'
-vagrant ssh -c 'sudo tail -f /var/log/tabris/bot.log'
+vagrant ssh -c 'sudo tail -f /var/log/tabris/run_server.log'
 ```
 - 초대된 Slack 채널에서 봇을 멘션하거나 DM을 보내 `RAW incoming body` / `[mention]` 로그가 찍히는지 확인.
 

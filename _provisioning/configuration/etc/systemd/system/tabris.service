@@ -13,8 +13,8 @@ Environment=TABRIS_SETTINGS=/etc/tabris/settings_local.py
 ExecStart=/opt/tabris/venv/bin/python -u run_server.py
 Restart=always
 RestartSec=5
-StandardOutput=append:/var/log/tabris/bot.log
-StandardError=append:/var/log/tabris/bot.log
+StandardOutput=append:/var/log/tabris/run_server.log
+StandardError=append:/var/log/tabris/run_server.log
 TimeoutStopSec=15
 KillMode=mixed
 

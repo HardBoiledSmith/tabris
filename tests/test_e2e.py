@@ -63,7 +63,7 @@ def test_mention_happy_path_posts_claude_result(run_server_module, slack_client,
 
 
 def test_disallowed_team_is_rejected_without_claude(run_server_module, slack_client, monkeypatch):
-    """ALLOWED_TEAM_IDS에 없는 팀이면 거부 메시지만 보내고 Claude를 돌리지 않는다."""
+    """ALLOWED_TEAM_ID와 다른 팀이면 거부 메시지만 보내고 Claude를 돌리지 않는다."""
     run_mock = MagicMock()
     monkeypatch.setattr(run_server_module.subprocess, 'run', run_mock)
 

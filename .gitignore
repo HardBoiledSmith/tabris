@@ -5,7 +5,7 @@ db.sqlite3
 .env
 .venv/
 venv/
-
+_provisioning/configuration/root/.aws/config
 .vagrant/
 settings_local.py
 id_ed25519
