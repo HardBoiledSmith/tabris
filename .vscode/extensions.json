@@ -1,0 +1,10 @@
+{
+    "recommendations": [
+      "ms-python.python",
+      "ms-python.debugpy",
+      "anysphere.remote-ssh",
+      "vscodevim.vim",
+      "eamodio.gitlens",
+      "anysphere.cursorpyright"
+    ]
+}
