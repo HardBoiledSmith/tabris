@@ -1,0 +1,22 @@
+[Unit]
+Description=tabris - Slack Bolt bot running Claude Code in Docker sandboxes
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tabris
+Environment=PYTHONUNBUFFERED=1
+Environment=TABRIS_SETTINGS=/etc/tabris/settings_local.py
+ExecStart=/opt/tabris/venv/bin/python -u bot.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/tabris/bot.log
+StandardError=append:/var/log/tabris/bot.log
+TimeoutStopSec=15
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

@@ -2,3 +2,12 @@
 .vagrant
 __pycache__
 db.sqlite3
+.env
+.venv/
+venv/
+
+.vagrant/
+settings_local.py
+id_ed25519
+id_ed25519.pub
+.gitconfig
