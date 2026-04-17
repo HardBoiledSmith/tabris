@@ -10,7 +10,7 @@ User=root
 WorkingDirectory=/opt/tabris
 Environment=PYTHONUNBUFFERED=1
 Environment=TABRIS_SETTINGS=/etc/tabris/settings_local.py
-ExecStart=/opt/tabris/venv/bin/python -u bot.py
+ExecStart=/opt/tabris/venv/bin/python -u run_server.py
 Restart=always
 RestartSec=5
 StandardOutput=append:/var/log/tabris/bot.log

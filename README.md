@@ -4,10 +4,10 @@ Slack Bolt (Socket Mode) 기반 봇. 사용자의 멘션/DM에 응답하여 Dock
 
 ## 구성
 
-- `bot.py` — Slack Bolt 앱. Socket Mode로 연결, 이벤트 수신 시 `docker run`으로 `my-claude-sandbox` 컨테이너에서 Claude Code 실행.
+- `run_server.py` — Slack Bolt 앱. Socket Mode로 연결, 이벤트 수신 시 `docker run`으로 `my-claude-sandbox` 컨테이너에서 Claude Code 실행.
 - `Dockerfile` — `my-claude-sandbox` 이미지. `node:20-slim` 위에 `@anthropic-ai/claude-code`를 전역 설치한 최소 런타임.
 - `mcp.json` — Claude Code MCP 서버 설정. 기본은 빈 설정으로 시작 가능.
-- `requirements.txt` — Python 의존성 (`slack-bolt`, `python-dotenv`).
+- `_provisioning/requirements.txt` — Python 의존성 (`slack-bolt`, `slack-markdown-parser` 등).
 - `_provisioning/` — Vagrant VM 프로비저닝. 상세는 아래 섹션.
 
 ## 1. Slack App 설정 (최초 1회)
@@ -23,7 +23,7 @@ Slack Bolt (Socket Mode) 기반 봇. 사용자의 멘션/DM에 응답하여 Dock
 - 발급된 `xapp-...` 토큰을 `SLACK_APP_TOKEN`에 사용.
 
 ### ③ OAuth & Permissions — Bot Token Scopes
-`bot.py`가 호출하는 API에 필요한 최소 스코프:
+`run_server.py`가 호출하는 API에 필요한 최소 스코프:
 
 | 스코프 | 필요 이유 |
 |--------|-----------|
@@ -63,7 +63,7 @@ cp .env.example .env
 # → SLACK_BOT_TOKEN, SLACK_APP_TOKEN, BOT_USER_ID, ANTHROPIC_API_KEY 채우기
 
 docker build -t my-claude-sandbox .
-python bot.py
+python run_server.py
 ```
 
 ## 3. Vagrant VM 실행
@@ -127,9 +127,8 @@ vagrant destroy -f     # VM 완전 삭제
 | `SLACK_APP_TOKEN` | ✓ | — | `xapp-` 앱 토큰 (Socket Mode) |
 | `BOT_USER_ID` | ✓ | — | 봇 member ID (`U...`) |
 | `ANTHROPIC_API_KEY` | ✓ | — | Claude Code 실행용 API 키 |
-| `MCP_CONFIG_PATH` |   | `./mcp.json` | MCP 서버 설정 경로 |
 | `DOCKER_IMAGE` |   | `my-claude-sandbox` | sandbox 이미지명 |
 | `CLAUDE_TIMEOUT` |   | `120` | Claude 실행 타임아웃(초) |
 | `MAX_WORKERS` |   | `5` | 동시 처리 스레드 수 |
 
-VM에서는 `/etc/tabris/settings_local.py`에 Python 상수로 정의하면 `bot.py`가 기동 시 `os.environ`에 주입한다. 로컬 Mac에서는 루트의 `.env`가 `load_dotenv()`로 로드된다.
+VM에서는 `/etc/tabris/settings_local.py`에 Python 상수로 정의한다. 로컬 개발 시에도 동일하게 `settings_local`를 import할 수 있는 경로에 두면 된다.

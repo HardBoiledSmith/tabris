@@ -2,9 +2,9 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Stop bot.py",
+            "label": "Stop run_server.py",
             "type": "shell",
-            "command": "systemctl stop tabris; pkill -9 -f bot.py || true",
+            "command": "systemctl stop tabris; pkill -9 -f run_server.py || true",
             "presentation": {
                 "reveal": "silent",
                 "panel": "shared"

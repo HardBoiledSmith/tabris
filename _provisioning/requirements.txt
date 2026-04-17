@@ -1,2 +1,2 @@
 slack-bolt>=1.18.0
-python-dotenv>=1.0.0
+slack-markdown-parser>=2.3.0

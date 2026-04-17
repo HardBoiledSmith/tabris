@@ -2,14 +2,14 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Bot: bot.py",
+            "name": "Bot: run_server.py",
             "type": "python",
             "request": "launch",
-            "program": "bot.py",
+            "program": "run_server.py",
             "console": "integratedTerminal",
             "justMyCode": false,
             "python": "/opt/tabris/venv/bin/python3",
-            "preLaunchTask": "Stop bot.py"
+            "preLaunchTask": "Stop run_server.py"
         }
     ]
 }
