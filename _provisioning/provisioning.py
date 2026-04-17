@@ -110,6 +110,8 @@ def _setup_venv():
                 if ll_stripped and not ll_stripped.startswith('#'):
                     _run([venv_pip, 'install', ll_stripped])
 
+    _run([venv_pip, 'install', 'ruff'])
+
 
 def _setup_docker():
     _print_line_number()
