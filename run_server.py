@@ -10,7 +10,10 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_markdown_parser import convert_markdown_to_slack_payloads
 
+from const import TEAM_ACCESS_DENIED_TEXT
+
 sys.path.append('/etc/tabris')
+from settings_local import ALLOWED_TEAM_IDS
 from settings_local import ANTHROPIC_API_KEY
 from settings_local import BOT_USER_ID
 from settings_local import CLAUDE_TIMEOUT
@@ -60,6 +63,39 @@ def build_context(messages: list, is_dm: bool) -> str:
                 lines.append(f'{role}: {clean_text}')
 
     return '\n'.join(lines)
+
+
+def _normalize_slack_team_id(raw):
+    """이벤트에서 읽은 team 필드를 문자열 Team ID로 정규화한다."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return (raw.get('id') or raw.get('team_id') or '').strip() or None
+    return str(raw).strip() or None
+
+
+def is_allowed_slack_team(event: dict) -> bool:
+    """메시지가 발생한 Slack 워크스페이스(team)가 ALLOWED_TEAM_IDS에 포함되는지 본다.
+
+    ALLOWED_TEAM_IDS가 비어 있으면 검사하지 않는다(기존·로컬 호환).
+    team_id를 알 수 없으면 안전하게 거부한다.
+    """
+
+    allowed = ALLOWED_TEAM_IDS
+    if not allowed:
+        return True
+    ids = {t for t in allowed if t}
+    if not ids:
+        return True
+    tid = _normalize_slack_team_id(event.get('team_id') or event.get('team'))
+    if not tid:
+        logger.warning(
+            'Slack event without team_id; denying. user=%s event_keys=%s',
+            event.get('user'),
+            list(event.keys()),
+        )
+        return False
+    return tid in ids
 
 
 def post_claude_markdown_to_thread(
@@ -201,8 +237,21 @@ def handle_request(event: dict, client):
 
     msg_type = 'DM' if is_dm else 'mention'
     logger.info(
-        '[%s] channel=%s thread_ts=%s user=%s text=%r', msg_type, channel, thread_ts, event.get('user'), user_request
+        '[%s] channel=%s thread_ts=%s team_id=%s user=%s text=%r',
+        msg_type,
+        channel,
+        thread_ts,
+        _normalize_slack_team_id(event.get('team_id') or event.get('team')),
+        event.get('user'),
+        user_request,
     )
+
+    if not is_allowed_slack_team(event):
+        try:
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=TEAM_ACCESS_DENIED_TEXT)
+        except Exception:
+            logger.exception('Failed to post team access denied message')
+        return
 
     if not user_request:
         return
