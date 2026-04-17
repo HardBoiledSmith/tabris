@@ -4,8 +4,8 @@ Slack Bolt (Socket Mode) 기반 봇. 사용자의 멘션/DM에 응답하여 Dock
 
 ## 구성
 
-- `run_server.py` — Slack Bolt 앱. Socket Mode로 연결, 이벤트 수신 시 `docker run`으로 `my-claude-sandbox` 컨테이너에서 Claude Code 실행.
-- `Dockerfile` — `my-claude-sandbox` 이미지. `node:20-slim` 위에 `@anthropic-ai/claude-code`를 전역 설치한 최소 런타임.
+- `run_server.py` — Slack Bolt 앱. Socket Mode로 연결, 이벤트 수신 시 `docker run`으로 `hbsmith-claude-sandbox` 컨테이너에서 Claude Code 실행.
+- `Dockerfile` — `hbsmith-claude-sandbox` 이미지. `node:20-slim` 위에 `@anthropic-ai/claude-code`를 전역 설치한 최소 런타임.
 - `mcp.json` — Claude Code MCP 서버 설정. 기본은 빈 설정으로 시작 가능.
 - `_provisioning/requirements.txt` — Python 의존성 (`slack-bolt`, `slack-markdown-parser` 등).
 - `_provisioning/` — Vagrant VM 프로비저닝. 상세는 아래 섹션.
@@ -62,7 +62,7 @@ pip install -r requirements.txt
 cp .env.example .env
 # → SLACK_BOT_TOKEN, SLACK_APP_TOKEN, BOT_USER_ID, ANTHROPIC_API_KEY 채우기
 
-docker build -t my-claude-sandbox .
+docker build -t hbsmith-claude-sandbox .
 python run_server.py
 ```
 
@@ -110,7 +110,7 @@ vagrant ssh -c 'cd /opt/tabris && sudo git pull && sudo systemctl restart tabris
 vagrant provision
 
 # Dockerfile / sandbox 이미지 재빌드
-vagrant ssh -c 'sudo docker build -t my-claude-sandbox /opt/tabris'
+vagrant ssh -c 'sudo docker build -t hbsmith-claude-sandbox /opt/tabris'
 ```
 
 ### ⑥ 종료 / 정리
@@ -127,7 +127,7 @@ vagrant destroy -f     # VM 완전 삭제
 | `SLACK_APP_TOKEN` | ✓ | — | `xapp-` 앱 토큰 (Socket Mode) |
 | `BOT_USER_ID` | ✓ | — | 봇 member ID (`U...`) |
 | `ANTHROPIC_API_KEY` | ✓ | — | Claude Code 실행용 API 키 |
-| `DOCKER_IMAGE` |   | `my-claude-sandbox` | sandbox 이미지명 |
+| `DOCKER_IMAGE` |   | `hbsmith-claude-sandbox` | sandbox 이미지명 |
 | `CLAUDE_TIMEOUT` |   | `120` | Claude 실행 타임아웃(초) |
 | `MAX_WORKERS` |   | `5` | 동시 처리 스레드 수 |
 

@@ -118,7 +118,7 @@ def _setup_docker():
     _run(['systemctl', 'enable', 'docker'])
     _run(['systemctl', 'start', 'docker'])
 
-    _run(['docker', 'build', '-t', 'my-claude-sandbox', '/opt/tabris'])
+    _run(['docker', 'build', '-t', 'hbsmith-claude-sandbox', '/opt/tabris'])
 
 
 def main():
