@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "my-server": {
+    "op-nerv-mcp": {
       "type": "http",
-      "url": "http://host.docker.internal:3000/mcp"
+      "url": "https://op-nerv.hbsmith.io/mcp"
     }
   }
 }
