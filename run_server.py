@@ -15,6 +15,9 @@ from const import TEAM_ACCESS_DENIED_TEXT
 sys.path.append('/etc/tabris')
 from settings_local import ALLOWED_TEAM_ID
 from settings_local import ANTHROPIC_API_KEY
+from settings_local import AWS_ACCESS_KEY_ID
+from settings_local import AWS_DEFAULT_REGION
+from settings_local import AWS_SECRET_ACCESS_KEY
 from settings_local import BOT_USER_ID
 from settings_local import CLAUDE_TIMEOUT
 from settings_local import DOCKER_IMAGE
@@ -179,6 +182,12 @@ def run_claude(event: dict, context: str, request: str) -> str:
             f'{workspace}:/workspace:ro',
             '-e',
             f'ANTHROPIC_API_KEY={ANTHROPIC_API_KEY}',
+            '-e',
+            f'AWS_ACCESS_KEY_ID={AWS_ACCESS_KEY_ID}',
+            '-e',
+            f'AWS_SECRET_ACCESS_KEY={AWS_SECRET_ACCESS_KEY}',
+            '-e',
+            f'AWS_DEFAULT_REGION={AWS_DEFAULT_REGION}',
             '-e',
             f'JIRA_API_KEY={JIRA_API_KEY}',
             '-e',
