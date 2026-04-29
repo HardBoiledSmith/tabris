@@ -1,9 +1,12 @@
 import json
 import logging
 import os
+import queue
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from slack_bolt import App
@@ -146,7 +149,18 @@ def post_claude_markdown_to_thread(
         )
 
 
-def run_claude(event: dict, context: str, request: str) -> str:
+def _build_progress_text(elapsed_sec: int, logs: list[str], is_silent: bool = False) -> str:
+    """중간 진행 상태를 Slack waiting 메시지에 표시할 텍스트를 만든다."""
+    if is_silent:
+        return f'⏳ 처리 중... ({elapsed_sec}s 경과, 새 로그 대기 중)'
+    if not logs:
+        return f'⏳ 처리 중... ({elapsed_sec}s 경과)'
+
+    recent_logs = '\n'.join(logs[-12:])
+    return f'⏳ 처리 중... ({elapsed_sec}s 경과)\n```{recent_logs}```'
+
+
+def run_claude(event: dict, context: str, request: str, progress_callback=None) -> str:
     thread_ts = event.get('thread_ts') or event.get('ts')
     msg_id = event.get('client_msg_id') or event.get('ts')
     is_dm = event.get('channel_type') == 'im'
@@ -210,16 +224,95 @@ def run_claude(event: dict, context: str, request: str) -> str:
             'json',
         ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=CLAUDE_TIMEOUT)
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
 
-        if result.returncode != 0:
-            logger.error('Claude exited with code %d: %s', result.returncode, result.stderr)
-            return f'⚠️ 실행 오류:\n```{result.stderr[:300]}```'
+        output_queue: queue.Queue = queue.Queue()
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        recent_logs: list[str] = []
+
+        def _enqueue_stream(stream, stream_name: str) -> None:
+            try:
+                for line in iter(stream.readline, ''):
+                    output_queue.put((stream_name, line))
+            finally:
+                stream.close()
+
+        stdout_thread = threading.Thread(
+            target=_enqueue_stream,
+            args=(process.stdout, 'stdout'),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=_enqueue_stream,
+            args=(process.stderr, 'stderr'),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+
+        started_at = time.time()
+        last_activity_at = started_at
+        last_progress_at = started_at
+        progress_interval_sec = 10
+        silent_notice_sec = 60
+
+        while True:
+            now = time.time()
+            elapsed = int(now - started_at)
+            if elapsed > CLAUDE_TIMEOUT:
+                process.kill()
+                return f'⚠️ 작업 시간 초과 ({CLAUDE_TIMEOUT}초)'
+
+            try:
+                stream_name, chunk = output_queue.get(timeout=1)
+                if stream_name == 'stdout':
+                    stdout_chunks.append(chunk)
+                else:
+                    stderr_chunks.append(chunk)
+
+                line = chunk.strip()
+                if line:
+                    recent_logs.append(line)
+                    if len(recent_logs) > 50:
+                        recent_logs = recent_logs[-50:]
+                last_activity_at = now
+
+                if progress_callback and now - last_progress_at >= progress_interval_sec:
+                    progress_callback(_build_progress_text(elapsed, recent_logs))
+                    last_progress_at = now
+            except queue.Empty:
+                pass
+
+            now = time.time()
+            if (
+                progress_callback
+                and now - last_activity_at >= silent_notice_sec
+                and now - last_progress_at >= progress_interval_sec
+            ):
+                progress_callback(_build_progress_text(int(now - started_at), recent_logs, is_silent=True))
+                last_progress_at = now
+
+            if process.poll() is not None and output_queue.empty():
+                break
+
+        stdout = ''.join(stdout_chunks)
+        stderr = ''.join(stderr_chunks)
+
+        if process.returncode != 0:
+            logger.error('Claude exited with code %d: %s', process.returncode, stderr)
+            return f'⚠️ 실행 오류:\n```{stderr[:300]}```'
 
         try:
-            output = json.loads(result.stdout)
+            output = json.loads(stdout)
         except json.JSONDecodeError:
-            return result.stdout.strip() or '⚠️ 응답을 파싱할 수 없습니다.'
+            return stdout.strip() or '⚠️ 응답을 파싱할 수 없습니다.'
 
         usage = output.get('usage') or {}
         token_used = (
@@ -238,10 +331,7 @@ def run_claude(event: dict, context: str, request: str) -> str:
             msg_id,
             token_used,
         )
-        return output.get('result') or output.get('content') or result.stdout
-
-    except subprocess.TimeoutExpired:
-        return f'⚠️ 작업 시간 초과 ({CLAUDE_TIMEOUT}초)'
+        return output.get('result') or output.get('content') or stdout
     except Exception as e:
         logger.exception('Unexpected error in run_claude')
         return f'⚠️ 오류: {e}'
@@ -293,7 +383,13 @@ def handle_request(event: dict, client):
         history_msgs = []
 
     context = build_context(history_msgs, is_dm)
-    answer = run_claude(event, context, user_request)
+    def _progress_callback(progress_text: str) -> None:
+        try:
+            client.chat_update(channel=channel, ts=waiting_msg['ts'], text=progress_text)
+        except Exception:
+            logger.warning('Failed to post progress update', exc_info=True)
+
+    answer = run_claude(event, context, user_request, progress_callback=_progress_callback)
 
     try:
         post_claude_markdown_to_thread(
