@@ -149,15 +149,58 @@ def post_claude_markdown_to_thread(
         )
 
 
-def _build_progress_text(elapsed_sec: int, logs: list[str], is_silent: bool = False) -> str:
-    """중간 진행 상태를 Slack waiting 메시지에 표시할 텍스트를 만든다."""
-    if is_silent:
-        return f'⏳ 처리 중... ({elapsed_sec}s 경과, 새 로그 대기 중)'
-    if not logs:
-        return f'⏳ 처리 중... ({elapsed_sec}s 경과)'
+def _stream_json_progress_snippets(obj: dict) -> list[str]:
+    """stream-json 한 레코드를 jq 예시와 같은 사용자 친화 한 줄들로 변환한다."""
+    out: list[str] = []
+    t = obj.get('type')
+    if t == 'assistant':
+        msg = obj.get('message') or {}
+        content = msg.get('content')
+        if not isinstance(content, list):
+            return out
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            bt = block.get('type')
+            if bt == 'tool_use':
+                name = block.get('name') or '?'
+                out.append(f'⚙️ [{name}] 실행 중...')
+            elif bt == 'text':
+                text = (block.get('text') or '').strip()
+                if text:
+                    if len(text) > 120:
+                        text = f'{text[:117]}…'
+                    out.append(f'💬 {text}')
+    elif t == 'result':
+        result = obj.get('result')
+        if result is not None:
+            s = str(result).strip()
+            if len(s) > 200:
+                s = f'{s[:197]}…'
+            out.append(f'✅ 완료: {s}')
+    return out
 
-    recent_logs = '\n'.join(logs[-12:])
-    return f'⏳ 처리 중... ({elapsed_sec}s 경과)\n```{recent_logs}```'
+
+def _build_progress_text(
+    elapsed_sec: int,
+    stream_lines: list[str],
+    stderr_lines: list[str],
+    is_silent: bool = False,
+) -> str:
+    """중간 진행 상태를 Slack waiting 메시지에 표시할 텍스트를 만든다."""
+    header = f'⏳ 처리 중... ({elapsed_sec}s 경과)'
+    if is_silent:
+        if stream_lines:
+            tail = '\n'.join(stream_lines[-12:])
+            return f'{header}\n(새 스트림 이벤트 대기 중)\n{tail}'
+        return f'{header}, 새 로그 대기 중'
+    if stream_lines:
+        recent = '\n'.join(stream_lines[-12:])
+        return f'{header}\n{recent}'
+    if stderr_lines:
+        recent = '\n'.join(stderr_lines[-12:])
+        return f'{header}\n```{recent}```'
+    return header
 
 
 def run_claude(event: dict, context: str, request: str, progress_callback=None) -> str:
@@ -220,8 +263,9 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
             '-p',
             prompt,
             '--dangerously-skip-permissions',
+            '--verbose',
             '--output-format',
-            'json',
+            'stream-json',
         ]
 
         process = subprocess.Popen(
@@ -235,7 +279,26 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
         output_queue: queue.Queue = queue.Queue()
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
-        recent_logs: list[str] = []
+        stream_display_lines: list[str] = []
+        stderr_lines: list[str] = []
+        final_result_obj: dict | None = None
+        last_stream_notify_at = 0.0
+        stream_notify_min_sec = 2.0
+        stream_notify_force_min_sec = 1.0
+
+        def _notify_progress(now_t: float, *, force: bool = False) -> None:
+            """Slack 대기 메시지 갱신. 스트림 이벤트는 force로 더 자주 반영(과도한 API 호출 방지)."""
+            nonlocal last_stream_notify_at
+            if not progress_callback:
+                return
+            min_gap = stream_notify_force_min_sec if force else stream_notify_min_sec
+            if (now_t - last_stream_notify_at) < min_gap:
+                return
+            last_stream_notify_at = now_t
+            elapsed_i = int(now_t - started_at)
+            progress_callback(
+                _build_progress_text(elapsed_i, stream_display_lines, stderr_lines),
+            )
 
         def _enqueue_stream(stream, stream_name: str) -> None:
             try:
@@ -274,18 +337,37 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
                 stream_name, chunk = output_queue.get(timeout=1)
                 if stream_name == 'stdout':
                     stdout_chunks.append(chunk)
+                    line = chunk.strip()
+                    if line:
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            if len(line) > 300:
+                                line = f'{line[:297]}…'
+                            stderr_lines.append(line)
+                            if len(stderr_lines) > 50:
+                                stderr_lines[:] = stderr_lines[-50:]
+                        else:
+                            if obj.get('type') == 'result':
+                                final_result_obj = obj
+                            snippets = _stream_json_progress_snippets(obj)
+                            if snippets:
+                                stream_display_lines.extend(snippets)
+                                if len(stream_display_lines) > 80:
+                                    stream_display_lines[:] = stream_display_lines[-80:]
+                                _notify_progress(now, force=True)
                 else:
                     stderr_chunks.append(chunk)
+                    line = chunk.strip()
+                    if line:
+                        stderr_lines.append(line)
+                        if len(stderr_lines) > 50:
+                            stderr_lines[:] = stderr_lines[-50:]
 
-                line = chunk.strip()
-                if line:
-                    recent_logs.append(line)
-                    if len(recent_logs) > 50:
-                        recent_logs = recent_logs[-50:]
                 last_activity_at = now
 
                 if progress_callback and now - last_progress_at >= progress_interval_sec:
-                    progress_callback(_build_progress_text(elapsed, recent_logs))
+                    _notify_progress(now, force=False)
                     last_progress_at = now
             except queue.Empty:
                 pass
@@ -296,7 +378,14 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
                 and now - last_activity_at >= silent_notice_sec
                 and now - last_progress_at >= progress_interval_sec
             ):
-                progress_callback(_build_progress_text(int(now - started_at), recent_logs, is_silent=True))
+                progress_callback(
+                    _build_progress_text(
+                        int(now - started_at),
+                        stream_display_lines,
+                        stderr_lines,
+                        is_silent=True,
+                    ),
+                )
                 last_progress_at = now
 
             if process.poll() is not None and output_queue.empty():
@@ -309,10 +398,24 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
             logger.error('Claude exited with code %d: %s', process.returncode, stderr)
             return f'⚠️ 실행 오류:\n```{stderr[:300]}```'
 
-        try:
-            output = json.loads(stdout)
-        except json.JSONDecodeError:
-            return stdout.strip() or '⚠️ 응답을 파싱할 수 없습니다.'
+        if final_result_obj is not None:
+            output = final_result_obj
+        else:
+            output = None
+            for ln in reversed([x.strip() for x in ''.join(stdout_chunks).splitlines() if x.strip()]):
+                try:
+                    cand = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue
+                if cand.get('type') == 'result':
+                    output = cand
+                    break
+            if output is None:
+                return stdout.strip() or '⚠️ 응답을 파싱할 수 없습니다.'
+
+        if output.get('is_error'):
+            err_txt = str(output.get('result') or '')
+            return f'⚠️ 실행 오류:\n```{err_txt[:500]}```'
 
         usage = output.get('usage') or {}
         token_used = (
@@ -383,6 +486,7 @@ def handle_request(event: dict, client):
         history_msgs = []
 
     context = build_context(history_msgs, is_dm)
+
     def _progress_callback(progress_text: str) -> None:
         try:
             client.chat_update(channel=channel, ts=waiting_msg['ts'], text=progress_text)
