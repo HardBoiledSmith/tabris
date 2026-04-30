@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 import queue
@@ -149,21 +148,11 @@ def post_claude_markdown_to_thread(
         )
 
 
-def _build_progress_text(
-    elapsed_sec: int,
-    stderr_lines: list[str],
-    is_silent: bool = False,
-) -> str:
-    """중간 진행 상태를 Slack 대기 메시지에 표시한다 (--verbose stderr 위주, json 출력 모드)."""
+def _progress_waiting_text(elapsed_sec: int, is_silent: bool = False) -> str:
+    """Claude 실행 중 Slack 대기 메시지 텍스트 (텍스트 출력 모드에서는 경과 시간만 표시)."""
     header = f'⏳ 처리 중... ({elapsed_sec}s 경과)'
     if is_silent:
-        if stderr_lines:
-            tail = '\n'.join(stderr_lines[-12:])
-            return f'{header}\n(새 로그 대기 중)\n```{tail}```'
-        return f'{header}, 새 로그 대기 중'
-    if stderr_lines:
-        recent = '\n'.join(stderr_lines[-12:])
-        return f'{header}\n```{recent}```'
+        return f'{header}\n응답 대기 중…'
     return header
 
 
@@ -227,9 +216,8 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
             '-p',
             prompt,
             '--dangerously-skip-permissions',
-            '--verbose',
             '--output-format',
-            'json',
+            'text',
         ]
 
         process = subprocess.Popen(
@@ -243,9 +231,6 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
         output_queue: queue.Queue = queue.Queue()
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
-        stderr_lines: list[str] = []
-        last_stderr_slack_notify_at = 0.0
-        stderr_slack_notify_min_sec = 2.0
 
         def _enqueue_stream(stream, stream_name: str) -> None:
             try:
@@ -283,45 +268,20 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
             try:
                 stream_name, chunk = output_queue.get(timeout=1)
                 now = time.time()
-                elapsed = int(now - started_at)
                 if stream_name == 'stdout':
                     stdout_chunks.append(chunk)
                 else:
                     stderr_chunks.append(chunk)
-                    line = chunk.strip()
-                    if line:
-                        stderr_lines.append(line)
-                        if len(stderr_lines) > 50:
-                            stderr_lines[:] = stderr_lines[-50:]
-                        if progress_callback and (now - last_stderr_slack_notify_at) >= stderr_slack_notify_min_sec:
-                            progress_callback(_build_progress_text(elapsed, stderr_lines))
-                            last_stderr_slack_notify_at = now
-                            last_progress_at = now
-
                 last_activity_at = now
-
-                if progress_callback and now - last_progress_at >= progress_interval_sec:
-                    progress_callback(_build_progress_text(elapsed, stderr_lines))
-                    last_progress_at = now
-                    last_stderr_slack_notify_at = now
             except queue.Empty:
                 pass
 
             now = time.time()
-            if (
-                progress_callback
-                and now - last_activity_at >= silent_notice_sec
-                and now - last_progress_at >= progress_interval_sec
-            ):
-                progress_callback(
-                    _build_progress_text(
-                        int(now - started_at),
-                        stderr_lines,
-                        is_silent=True,
-                    ),
-                )
+            elapsed = int(now - started_at)
+            if progress_callback and now - last_progress_at >= progress_interval_sec:
+                idle_long = now - last_activity_at >= silent_notice_sec
+                progress_callback(_progress_waiting_text(elapsed, is_silent=idle_long))
                 last_progress_at = now
-                last_stderr_slack_notify_at = now
 
             if process.poll() is not None and output_queue.empty():
                 break
@@ -333,33 +293,21 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
             logger.error('Claude exited with code %d: %s', process.returncode, stderr)
             return f'⚠️ 실행 오류:\n```{stderr[:300]}```'
 
-        try:
-            output = json.loads(stdout)
-        except json.JSONDecodeError:
-            return stdout.strip() or '⚠️ 응답을 파싱할 수 없습니다.'
-
-        if output.get('is_error'):
-            err_txt = str(output.get('result') or '')
-            return f'⚠️ 실행 오류:\n```{err_txt[:500]}```'
-
-        usage = output.get('usage') or {}
-        token_used = (
-            (usage.get('input_tokens') or 0)
-            + (usage.get('cache_creation_input_tokens') or 0)
-            + (usage.get('cache_read_input_tokens') or 0)
-            + (usage.get('output_tokens') or 0)
-        )
+        text_out = stdout.strip()
+        if not text_out:
+            return '⚠️ 응답이 비어 있습니다.'
+        output_length = len(text_out)
         logger.info(
-            '[RESPONSE] type=%s team_id=%s channel=%s thread_ts=%s user=%s msg_id=%s token_used=%d',
+            '[RESPONSE] type=%s team_id=%s channel=%s thread_ts=%s user=%s msg_id=%s output_length=%d',
             'DM' if is_dm else 'mention',
             _normalize_slack_team_id(event.get('team_id') or event.get('team')),
             event.get('channel'),
             thread_ts,
             event.get('user'),
             msg_id,
-            token_used,
+            output_length,
         )
-        return output.get('result') or output.get('content') or stdout
+        return text_out
     except Exception as e:
         logger.exception('Unexpected error in run_claude')
         return f'⚠️ 오류: {e}'
