@@ -9,6 +9,7 @@ DOCKER_IMAGE = 'hbsmith-claude-sandbox'
 JIRA_API_KEY = '...'
 JIRA_API_USERNAME = '...'
 MAX_WORKERS = 5
+NERV_MCP_TOKEN = '...'
 SENTRY_AUTH_TOKEN = '...'
 SLACK_APP_TOKEN = 'xapp-...'
 SLACK_BOT_TOKEN = 'xoxb-...'

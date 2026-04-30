@@ -2,7 +2,10 @@
   "mcpServers": {
     "op-nerv-mcp": {
       "type": "http",
-      "url": "https://op-nerv.hbsmith.io/mcp"
+      "url": "https://op-nerv.hbsmith.io/mcp",
+      "headers": {
+        "Authorization": "Bearer ${NERV_MCP_TOKEN}"
+      }
     }
   }
 }

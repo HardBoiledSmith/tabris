@@ -24,6 +24,7 @@ from settings_local import DOCKER_IMAGE
 from settings_local import JIRA_API_KEY
 from settings_local import JIRA_API_USERNAME
 from settings_local import MAX_WORKERS
+from settings_local import NERV_MCP_TOKEN
 from settings_local import SENTRY_AUTH_TOKEN
 from settings_local import SLACK_APP_TOKEN
 from settings_local import SLACK_BOT_TOKEN
@@ -196,6 +197,8 @@ def run_claude(event: dict, context: str, request: str) -> str:
             f'SLACK_BOT_TOKEN={SLACK_BOT_TOKEN}',
             '-e',
             f'SENTRY_AUTH_TOKEN={SENTRY_AUTH_TOKEN}',
+            '-e',
+            f'NERV_MCP_TOKEN={NERV_MCP_TOKEN}',
             '--workdir',
             '/workspace',
             DOCKER_IMAGE,

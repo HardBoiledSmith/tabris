@@ -19,6 +19,7 @@ def _install_settings_local_stub() -> None:
     m.JIRA_API_KEY = 'jira-key'
     m.JIRA_API_USERNAME = 'jira-user'
     m.MAX_WORKERS = 2
+    m.NERV_MCP_TOKEN = 'nerv-token'
     m.SENTRY_AUTH_TOKEN = 'sntrys_test'
     m.SLACK_APP_TOKEN = 'xapp-test'
     m.SLACK_BOT_TOKEN = 'xoxb-test'

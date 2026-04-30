@@ -127,6 +127,7 @@ vagrant destroy -f     # VM 완전 삭제
 | `SLACK_APP_TOKEN` | ✓ | — | `xapp-` 앱 토큰 (Socket Mode) |
 | `BOT_USER_ID` | ✓ | — | 봇 member ID (`U...`) |
 | `ANTHROPIC_API_KEY` | ✓ | — | Claude Code 실행용 API 키 |
+| `NERV_MCP_TOKEN` | ✓ | — | op-nerv MCP 서버 인증 토큰 |
 | `DOCKER_IMAGE` |   | `hbsmith-claude-sandbox` | sandbox 이미지명 |
 | `CLAUDE_TIMEOUT` |   | `120` | Claude 실행 타임아웃(초) |
 | `MAX_WORKERS` |   | `5` | 동시 처리 스레드 수 |
