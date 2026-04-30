@@ -215,6 +215,8 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
             'claude',
             '-p',
             prompt,
+            '--mcp-config',
+            'mcp.json',
             '--dangerously-skip-permissions',
             '--output-format',
             'text',
