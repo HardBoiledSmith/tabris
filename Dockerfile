@@ -19,6 +19,10 @@ RUN case "$(uname -m)" in \
 RUN npm install -g @anthropic-ai/claude-code @sentry/cli
 
 RUN useradd -m -u 1001 claude
+
+# Repo-managed Claude config/skills under /home/claude (build context: repo root).
+COPY --chown=claude:claude _provisioning/configuration/docker/home/claude/ /home/claude/
+
 USER claude
 
 WORKDIR /workspace

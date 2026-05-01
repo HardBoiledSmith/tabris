@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_markdown_parser import convert_markdown_to_slack_payloads
+from slack_sdk.errors import SlackApiError
 
 from const import TEAM_ACCESS_DENIED_TEXT
 
@@ -35,19 +36,15 @@ from settings_local import SLACK_BOT_TOKEN
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-ARTIFACTS_SUBDIR = 'artifacts'
 ARTIFACT_MAX_FILES = 10
 ARTIFACT_MAX_BYTES_PER_FILE = 1_048_576  # 1 MiB
 ARTIFACT_MAX_TOTAL_BYTES = 5_242_880  # 5 MiB
 
-# Docker 컨테이너에 마운트할 Claude 워크스페이스 템플릿(스킬, CLAUDE.md 등).
-WORKSPACE_TEMPLATE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    '_provisioning',
-    'configuration',
-    'docker',
-    'workspace',
-)
+# Docker 이미지에 포함된 Claude 설정(MCP 등). 워크스페이스 마운트와 무관하다.
+CLAUDE_CONFIG_IN_CONTAINER = '/home/claude/.claude.json'
+# Dockerfile `useradd -u 1001 claude`와 동기화. 바인드 마운트는 호스트 inode 권한을 따른다.
+CLAUDE_CONTAINER_UID = 1001
+CLAUDE_CONTAINER_GID = 1001
 
 app = App(token=SLACK_BOT_TOKEN)
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
@@ -154,24 +151,28 @@ def post_claude_markdown_to_thread(
         )
 
 
-def _collect_workspace_artifacts(artifacts_root: str) -> list[tuple[str, bytes]]:
-    """`/workspace/artifacts`에 대응하는 호스트 경로에서 일반 파일만 읽어 (상대경로, 바이트) 목록으로 반환한다.
+def _collect_workspace_files_for_upload(workspace_root: str) -> list[tuple[str, bytes]]:
+    """워크스페이스 루트 아래 일반 파일만 읽어 (상대경로, 바이트) 목록으로 반환한다.
 
-    디렉터리·숨김 파일·심볼릭 링크·비일반 파일은 건너뛴다. 모듈 상수 ARTIFACT_MAX_* 한도를 적용한다.
+    `.claude/` 트리는 건너뛴다. 디렉터리·숨김 파일·심볼릭 링크·비일반 파일은 건너뛴다.
+    ARTIFACT_MAX_* 한도를 적용한다.
     """
 
     max_files = ARTIFACT_MAX_FILES
     max_per_file = ARTIFACT_MAX_BYTES_PER_FILE
     max_total = ARTIFACT_MAX_TOTAL_BYTES
 
-    if not os.path.isdir(artifacts_root):
+    if not os.path.isdir(workspace_root):
         return []
 
+    workspace_root = os.path.abspath(workspace_root)
     out: list[tuple[str, bytes]] = []
     total_bytes = 0
 
-    for dirpath, dirnames, filenames in os.walk(artifacts_root, topdown=True):
+    for dirpath, dirnames, filenames in os.walk(workspace_root, topdown=True):
         dirnames.sort()
+        if '.claude' in dirnames:
+            dirnames.remove('.claude')
         filenames.sort()
         for name in filenames:
             if len(out) >= max_files:
@@ -183,7 +184,7 @@ def _collect_workspace_artifacts(artifacts_root: str) -> list[tuple[str, bytes]]
             if name.startswith('.'):
                 continue
             full_path = os.path.join(dirpath, name)
-            rel_path = os.path.relpath(full_path, artifacts_root)
+            rel_path = os.path.relpath(full_path, workspace_root)
             rel_posix = rel_path.replace(os.sep, '/')
             try:
                 if os.path.islink(full_path):
@@ -222,10 +223,9 @@ def _collect_workspace_artifacts(artifacts_root: str) -> list[tuple[str, bytes]]
 
 
 def post_workspace_artifacts_to_thread(client, channel: str, thread_ts: str, workspace: str) -> None:
-    """워크스페이스의 artifacts 디렉터리를 스캔해 Slack에 파일 업로드한다."""
+    """워크스페이스에서 업로드 대상 파일을 스캔해 Slack에 올린다."""
 
-    artifacts_root = os.path.join(workspace, ARTIFACTS_SUBDIR)
-    items = _collect_workspace_artifacts(artifacts_root)
+    items = _collect_workspace_files_for_upload(workspace)
     for rel_name, content in items:
         safe_title = rel_name.replace('/', '_')
         initial_comment = f'아티팩트: {safe_title}'
@@ -238,6 +238,18 @@ def post_workspace_artifacts_to_thread(client, channel: str, thread_ts: str, wor
                 title=safe_title,
                 initial_comment=initial_comment,
             )
+        except SlackApiError as exc:
+            body = exc.response
+            err = body.get('error') if body else None
+            if err == 'missing_scope':
+                logger.warning(
+                    'files_upload_v2 skipped for %s: Slack app missing scope(s) %r '
+                    '(e.g. add Bot scope "files:write" and reinstall the app)',
+                    rel_name,
+                    body.get('needed'),
+                )
+            else:
+                logger.warning('files_upload_v2 failed for %s', rel_name, exc_info=True)
         except Exception:
             logger.warning('files_upload_v2 failed for %s', rel_name, exc_info=True)
 
@@ -256,21 +268,23 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
     is_dm = event.get('channel_type') == 'im'
     workspace = f'/tmp/claude-sandbox/{thread_ts}'
     os.makedirs(workspace, exist_ok=True)
+    try:
+        os.chown(workspace, CLAUDE_CONTAINER_UID, CLAUDE_CONTAINER_GID)
+    except OSError:
+        try:
+            os.chmod(workspace, 0o777)
+        except OSError:
+            logger.warning(
+                'Could not chown/chmod workspace %s for container UID',
+                workspace,
+                exc_info=True,
+            )
 
     try:
-        if not os.path.isdir(WORKSPACE_TEMPLATE):
-            raise Exception('Workspace template missing: %s', WORKSPACE_TEMPLATE)
-        shutil.copytree(WORKSPACE_TEMPLATE, workspace, dirs_exist_ok=True)
-        os.makedirs(os.path.join(workspace, ARTIFACTS_SUBDIR), exist_ok=True)
-
-        ctx_file = os.path.join(workspace, 'context.md')
-        with open(ctx_file, 'w', encoding='utf-8') as f:
-            if context:
-                f.write(f'## 이전 대화\n{context}\n\n')
-            f.write(f'## 현재 요청\n{request}')
-
-        with open(ctx_file, encoding='utf-8') as f:
-            prompt = f.read()
+        if context:
+            prompt = f'## 이전 대화\n{context}\n\n## 현재 요청\n{request}'
+        else:
+            prompt = f'## 현재 요청\n{request}'
 
         cmd = [
             '/usr/bin/docker',
@@ -285,9 +299,7 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
             '--tmpfs',
             '/tmp',
             '-v',
-            f'{workspace}:/workspace:ro',
-            '-v',
-            f'{os.path.join(workspace, ARTIFACTS_SUBDIR)}:/workspace/{ARTIFACTS_SUBDIR}:rw',
+            f'{workspace}:/workspace:rw',
             '-e',
             f'ANTHROPIC_API_KEY={ANTHROPIC_API_KEY}',
             '-e',
@@ -313,7 +325,7 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
             '-p',
             prompt,
             '--mcp-config',
-            'mcp.json',
+            CLAUDE_CONFIG_IN_CONTAINER,
             '--dangerously-skip-permissions',
             '--output-format',
             'text',
@@ -484,6 +496,8 @@ def handle_request(event: dict, client):
                 client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
 
         post_workspace_artifacts_to_thread(client, channel, thread_ts, workspace)
+    except Exception:
+        logger.exception('Failed to process request', exc_info=True)
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
