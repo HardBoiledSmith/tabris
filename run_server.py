@@ -2,6 +2,7 @@ import logging
 import os
 import queue
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -33,6 +34,11 @@ from settings_local import SLACK_BOT_TOKEN
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+ARTIFACTS_SUBDIR = 'artifacts'
+ARTIFACT_MAX_FILES = 10
+ARTIFACT_MAX_BYTES_PER_FILE = 1_048_576  # 1 MiB
+ARTIFACT_MAX_TOTAL_BYTES = 5_242_880  # 5 MiB
 
 # Docker 컨테이너에 마운트할 Claude 워크스페이스 템플릿(스킬, CLAUDE.md 등).
 WORKSPACE_TEMPLATE = os.path.join(
@@ -148,6 +154,94 @@ def post_claude_markdown_to_thread(
         )
 
 
+def _collect_workspace_artifacts(artifacts_root: str) -> list[tuple[str, bytes]]:
+    """`/workspace/artifacts`에 대응하는 호스트 경로에서 일반 파일만 읽어 (상대경로, 바이트) 목록으로 반환한다.
+
+    디렉터리·숨김 파일·심볼릭 링크·비일반 파일은 건너뛴다. 모듈 상수 ARTIFACT_MAX_* 한도를 적용한다.
+    """
+
+    max_files = ARTIFACT_MAX_FILES
+    max_per_file = ARTIFACT_MAX_BYTES_PER_FILE
+    max_total = ARTIFACT_MAX_TOTAL_BYTES
+
+    if not os.path.isdir(artifacts_root):
+        return []
+
+    out: list[tuple[str, bytes]] = []
+    total_bytes = 0
+
+    for dirpath, dirnames, filenames in os.walk(artifacts_root, topdown=True):
+        dirnames.sort()
+        filenames.sort()
+        for name in filenames:
+            if len(out) >= max_files:
+                logger.warning(
+                    'Artifact collection stopped: max file count %d reached',
+                    max_files,
+                )
+                return out
+            if name.startswith('.'):
+                continue
+            full_path = os.path.join(dirpath, name)
+            rel_path = os.path.relpath(full_path, artifacts_root)
+            rel_posix = rel_path.replace(os.sep, '/')
+            try:
+                if os.path.islink(full_path):
+                    continue
+                st_mode = os.stat(full_path).st_mode
+                if not stat.S_ISREG(st_mode):
+                    continue
+                size = os.path.getsize(full_path)
+            except OSError:
+                logger.warning('Skipping unreadable artifact path %s', full_path, exc_info=True)
+                continue
+            if size > max_per_file:
+                logger.warning(
+                    'Skipping artifact %s: size %d exceeds per-file limit %d',
+                    rel_posix,
+                    size,
+                    max_per_file,
+                )
+                continue
+            if total_bytes + size > max_total:
+                logger.warning(
+                    'Artifact collection stopped: total byte limit %d would be exceeded',
+                    max_total,
+                )
+                return out
+            try:
+                with open(full_path, 'rb') as artifact_fp:
+                    blob = artifact_fp.read()
+            except OSError:
+                logger.warning('Failed to read artifact %s', full_path, exc_info=True)
+                continue
+            total_bytes += len(blob)
+            out.append((rel_posix, blob))
+
+    return out
+
+
+def post_workspace_artifacts_to_thread(client, channel: str, thread_ts: str, workspace: str) -> None:
+    """워크스페이스의 artifacts 디렉터리를 스캔해 Slack에 파일 업로드한다."""
+
+    artifacts_root = os.path.join(workspace, ARTIFACTS_SUBDIR)
+    items = _collect_workspace_artifacts(artifacts_root)
+    for rel_name, content in items:
+        safe_title = rel_name.replace('/', '_')
+        initial_comment = f'아티팩트: {safe_title}'
+        try:
+            client.files_upload_v2(
+                channel=channel,
+                thread_ts=thread_ts,
+                filename=safe_title,
+                content=content,
+                title=safe_title,
+                initial_comment=initial_comment,
+            )
+        except Exception:
+            logger.warning('files_upload_v2 failed for %s', rel_name, exc_info=True)
+
+
 def _progress_waiting_text(elapsed_sec: int, is_silent: bool = False) -> str:
     """Claude 실행 중 Slack 대기 메시지 텍스트 (텍스트 출력 모드에서는 경과 시간만 표시)."""
     header = f'⏳ 처리 중... ({elapsed_sec}s 경과)'
@@ -167,6 +261,7 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
         if not os.path.isdir(WORKSPACE_TEMPLATE):
             raise Exception('Workspace template missing: %s', WORKSPACE_TEMPLATE)
         shutil.copytree(WORKSPACE_TEMPLATE, workspace, dirs_exist_ok=True)
+        os.makedirs(os.path.join(workspace, ARTIFACTS_SUBDIR), exist_ok=True)
 
         ctx_file = os.path.join(workspace, 'context.md')
         with open(ctx_file, 'w', encoding='utf-8') as f:
@@ -191,6 +286,8 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
             '/tmp',
             '-v',
             f'{workspace}:/workspace:ro',
+            '-v',
+            f'{os.path.join(workspace, ARTIFACTS_SUBDIR)}:/workspace/{ARTIFACTS_SUBDIR}:rw',
             '-e',
             f'ANTHROPIC_API_KEY={ANTHROPIC_API_KEY}',
             '-e',
@@ -313,8 +410,6 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
     except Exception as e:
         logger.exception('Unexpected error in run_claude')
         return f'⚠️ 오류: {e}'
-    finally:
-        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def handle_request(event: dict, client):
@@ -368,23 +463,29 @@ def handle_request(event: dict, client):
         except Exception:
             logger.warning('Failed to post progress update', exc_info=True)
 
-    answer = run_claude(event, context, user_request, progress_callback=_progress_callback)
-
+    workspace = f'/tmp/claude-sandbox/{thread_ts}'
     try:
-        post_claude_markdown_to_thread(
-            client,
-            channel=channel,
-            thread_ts=thread_ts,
-            markdown_text=answer,
-            update_ts=waiting_msg['ts'],
-        )
-    except Exception:
-        logger.exception('Block Kit post failed, falling back to plain text')
+        answer = run_claude(event, context, user_request, progress_callback=_progress_callback)
+
         try:
-            client.chat_update(channel=channel, ts=waiting_msg['ts'], text=answer)
+            post_claude_markdown_to_thread(
+                client,
+                channel=channel,
+                thread_ts=thread_ts,
+                markdown_text=answer,
+                update_ts=waiting_msg['ts'],
+            )
         except Exception:
-            logger.warning('chat_update failed, falling back to new message', exc_info=True)
-            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
+            logger.exception('Block Kit post failed, falling back to plain text')
+            try:
+                client.chat_update(channel=channel, ts=waiting_msg['ts'], text=answer)
+            except Exception:
+                logger.warning('chat_update failed, falling back to new message', exc_info=True)
+                client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
+
+        post_workspace_artifacts_to_thread(client, channel, thread_ts, workspace)
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def _submit(event, client):

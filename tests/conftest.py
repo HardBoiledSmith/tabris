@@ -13,6 +13,9 @@ def _install_settings_local_stub() -> None:
     m = types.ModuleType('settings_local')
     m.ALLOWED_TEAM_ID = 'T_ALLOWED'
     m.ANTHROPIC_API_KEY = 'sk-test'
+    m.AWS_ACCESS_KEY_ID = 'aws-ak-test'
+    m.AWS_DEFAULT_REGION = 'ap-northeast-2'
+    m.AWS_SECRET_ACCESS_KEY = 'aws-sk-test'
     m.BOT_USER_ID = 'UBOT'
     m.CLAUDE_TIMEOUT = 30
     m.DOCKER_IMAGE = 'test-image'
@@ -38,6 +41,7 @@ _auth_patch = patch.object(
 _auth_patch.start()
 
 import run_server  # noqa: E402
+from tests.helpers import install_claude_popen_mock  # noqa: E402
 
 
 def _sync_submit(fn, *args, **kwargs):
@@ -62,6 +66,7 @@ def slack_client():
     client.chat_postMessage.return_value = {'ok': True, 'ts': '1700000000.000100'}
     client.chat_update.return_value = {'ok': True, 'ts': '1700000000.000100'}
     client.conversations_replies.return_value = {'messages': []}
+    client.files_upload_v2.return_value = {'ok': True}
     return client
 
 
@@ -70,12 +75,8 @@ def fake_claude_ok(monkeypatch):
     """Claude Docker 실행을 성공 응답으로 흉내낸다."""
 
     def _set(result_text: str = 'Hello from Claude'):
-        completed = MagicMock()
-        completed.returncode = 0
-        completed.stdout = f'{{"result": {result_text!r}}}'
-        completed.stderr = ''
-        monkeypatch.setattr(run_server.subprocess, 'run', MagicMock(return_value=completed))
-        return completed
+        install_claude_popen_mock(monkeypatch, stdout_text=result_text, returncode=0)
+        return None
 
     return _set
 
