@@ -34,7 +34,7 @@ Slack Bolt (Socket Mode) 기반 봇. 사용자의 멘션/DM에 응답하여 Dock
 | `im:history` | DM 메시지 및 스레드 |
 | `mpim:history` | 그룹 DM 스레드 |
 | `im:read` | DM 채널 메타데이터 |
-| `files:write` | Claude 세션 워크스페이스에서 생성된 파일을 스레드에 `files.upload` API로 업로드 |
+| `files:write` | `/workspace/output/`에 둔 최종 산출 파일만 스레드에 `files.upload` API로 업로드 |
 
 ### ④ Event Subscriptions
 - Enable Events = **On**.

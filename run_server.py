@@ -39,6 +39,8 @@ logger = logging.getLogger(__name__)
 ARTIFACT_MAX_FILES = 10
 ARTIFACT_MAX_BYTES_PER_FILE = 1_048_576  # 1 MiB
 ARTIFACT_MAX_TOTAL_BYTES = 5_242_880  # 5 MiB
+# Slack 파일 업로드는 이 하위만 스캔한다. 중간 산출은 컨테이너 `/tmp` 등에 두도록 CLAUDE.md로 안내한다.
+WORKSPACE_OUTPUT_SUBDIR = 'output'
 
 # Docker 이미지에 포함된 Claude 설정(MCP 등). 워크스페이스 마운트와 무관하다.
 CLAUDE_CONFIG_IN_CONTAINER = '/home/claude/.claude.json'
@@ -151,28 +153,26 @@ def post_claude_markdown_to_thread(
         )
 
 
-def _collect_workspace_files_for_upload(workspace_root: str) -> list[tuple[str, bytes]]:
-    """워크스페이스 루트 아래 일반 파일만 읽어 (상대경로, 바이트) 목록으로 반환한다.
+def _collect_workspace_files_for_upload(workspace: str) -> list[tuple[str, bytes]]:
+    """호스트 `{workspace}/output`만 스캔한다. 반환 경로는 output 기준 상대 경로(슬랙 파일명용).
 
-    `.claude/` 트리는 건너뛴다. 디렉터리·숨김 파일·심볼릭 링크·비일반 파일은 건너뛴다.
-    ARTIFACT_MAX_* 한도를 적용한다.
+    디렉터리·숨김 파일·심볼릭 링크·비일반 파일은 건너뛴다. ARTIFACT_MAX_* 한도를 적용한다.
     """
 
     max_files = ARTIFACT_MAX_FILES
     max_per_file = ARTIFACT_MAX_BYTES_PER_FILE
     max_total = ARTIFACT_MAX_TOTAL_BYTES
 
-    if not os.path.isdir(workspace_root):
+    output_dir = os.path.join(workspace, WORKSPACE_OUTPUT_SUBDIR)
+    if not os.path.isdir(output_dir):
         return []
 
-    workspace_root = os.path.abspath(workspace_root)
+    output_dir = os.path.abspath(output_dir)
     out: list[tuple[str, bytes]] = []
     total_bytes = 0
 
-    for dirpath, dirnames, filenames in os.walk(workspace_root, topdown=True):
+    for dirpath, dirnames, filenames in os.walk(output_dir, topdown=True):
         dirnames.sort()
-        if '.claude' in dirnames:
-            dirnames.remove('.claude')
         filenames.sort()
         for name in filenames:
             if len(out) >= max_files:
@@ -184,7 +184,7 @@ def _collect_workspace_files_for_upload(workspace_root: str) -> list[tuple[str, 
             if name.startswith('.'):
                 continue
             full_path = os.path.join(dirpath, name)
-            rel_path = os.path.relpath(full_path, workspace_root)
+            rel_path = os.path.relpath(full_path, output_dir)
             rel_posix = rel_path.replace(os.sep, '/')
             try:
                 if os.path.islink(full_path):
@@ -223,7 +223,7 @@ def _collect_workspace_files_for_upload(workspace_root: str) -> list[tuple[str, 
 
 
 def post_workspace_artifacts_to_thread(client, channel: str, thread_ts: str, workspace: str) -> None:
-    """워크스페이스에서 업로드 대상 파일을 스캔해 Slack에 올린다."""
+    """`{workspace}/output`만 스캔해 Slack에 파일로 올린다."""
 
     items = _collect_workspace_files_for_upload(workspace)
     for rel_name, content in items:
@@ -265,11 +265,15 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
     is_dm = event.get('channel_type') == 'im'
     workspace = f'/tmp/claude-sandbox/{thread_ts}'
     os.makedirs(workspace, exist_ok=True)
+    output_dir = os.path.join(workspace, WORKSPACE_OUTPUT_SUBDIR)
+    os.makedirs(output_dir, exist_ok=True)
     try:
         os.chown(workspace, CLAUDE_CONTAINER_UID, CLAUDE_CONTAINER_GID)
+        os.chown(output_dir, CLAUDE_CONTAINER_UID, CLAUDE_CONTAINER_GID)
     except OSError:
         try:
             os.chmod(workspace, 0o777)
+            os.chmod(output_dir, 0o777)
         except OSError:
             logger.warning(
                 'Could not chown/chmod workspace %s for container UID',
