@@ -1,12 +1,15 @@
 import logging
 import os
 import queue
+import re
 import shutil
 import stat
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 from slack_bolt import App
@@ -41,6 +44,10 @@ ARTIFACT_MAX_BYTES_PER_FILE = 1_048_576  # 1 MiB
 ARTIFACT_MAX_TOTAL_BYTES = 5_242_880  # 5 MiB
 # Slack 파일 업로드는 이 하위만 스캔한다. 중간 산출은 컨테이너 `/tmp` 등에 두도록 CLAUDE.md로 안내한다.
 WORKSPACE_OUTPUT_SUBDIR = 'output'
+# 트리거 메시지의 Slack 첨부만 호스트가 받아 컨테이너 `/workspace/input/`에 둔다.
+WORKSPACE_INPUT_SUBDIR = 'input'
+# DM에서 파일 공유만 있는 메시지 subtype. 그 외 subtype은 무시한다.
+SLACK_DM_ALLOWED_FILE_MESSAGE_SUBTYPES = frozenset({'file_share'})
 
 # Docker 이미지에 포함된 Claude 설정(MCP 등). 워크스페이스 마운트와 무관하다.
 CLAUDE_CONFIG_IN_CONTAINER = '/home/claude/.claude.json'
@@ -254,6 +261,130 @@ def post_workspace_artifacts_to_thread(client, channel: str, thread_ts: str, wor
             logger.warning('files_upload_v2 failed for %s', rel_name, exc_info=True)
 
 
+def _sanitize_slack_attachment_filename(raw_name: str) -> str:
+    """Slack 첨부 파일명을 단일 경로 세그먼트로 정규화한다(경로·제어문자 제거)."""
+
+    name = os.path.basename(str(raw_name or 'attached').replace('\\', '/'))
+    name = re.sub(r'[\x00-\x1f]', '', name).strip()
+    name = name.replace('/', '_')
+    if not name or name in {'.', '..'}:
+        name = 'attached'
+    max_len = 200
+    if len(name) > max_len:
+        root, ext = os.path.splitext(name)
+        name = root[: max_len - len(ext)] + ext
+    return name or 'attached'
+
+
+def _slack_private_file_url(file_obj: dict) -> str | None:
+    """Slack file 객체에서 Bot 토큰으로 GET 가능한 비공개 URL을 고른다."""
+
+    return file_obj.get('url_private_download') or file_obj.get('url_private')
+
+
+def _read_slack_private_url(url: str, bot_token: str, max_bytes: int) -> bytes | None:
+    """Slack `url_private*` GET. `max_bytes`를 넘기면 None."""
+
+    req = urllib.request.Request(
+        url,
+        headers={'Authorization': f'Bearer {bot_token}'},
+        method='GET',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            cl = resp.headers.get('Content-Length')
+            if cl is not None:
+                try:
+                    if int(cl) > max_bytes:
+                        logger.warning(
+                            'Skipping Slack attachment: Content-Length %s exceeds %d',
+                            cl,
+                            max_bytes,
+                        )
+                        return None
+                except ValueError:
+                    pass
+            data = resp.read(max_bytes + 1)
+    except (OSError, urllib.error.HTTPError, urllib.error.URLError) as exc:
+        logger.warning('Slack attachment download failed: %s', exc, exc_info=True)
+        return None
+    if len(data) > max_bytes:
+        logger.warning('Slack attachment exceeds max_bytes after read')
+        return None
+    return data
+
+
+def download_slack_message_files_to_input(event: dict, workspace: str, bot_token: str) -> list[str]:
+    """트리거 메시지 `event['files']`만 내려받아 `{workspace}/input/`에 저장한다.
+
+    반환: 워크스페이스 기준 POSIX 상대 경로(예: `input/a.txt`). ARTIFACT_MAX_* 한도를 적용한다.
+    """
+
+    files = event.get('files') or []
+    if not files:
+        return []
+
+    input_dir = os.path.join(workspace, WORKSPACE_INPUT_SUBDIR)
+    os.makedirs(input_dir, exist_ok=True)
+
+    saved: list[str] = []
+    used_names: set[str] = set()
+    total_bytes = 0
+    max_files = ARTIFACT_MAX_FILES
+    max_per = ARTIFACT_MAX_BYTES_PER_FILE
+    max_total = ARTIFACT_MAX_TOTAL_BYTES
+
+    for file_obj in files:
+        if len(saved) >= max_files:
+            logger.warning('Slack input files: max file count %d reached', max_files)
+            break
+        if not isinstance(file_obj, dict):
+            continue
+        url = _slack_private_file_url(file_obj)
+        if not url:
+            logger.warning(
+                'Slack file object has no private URL; skipping id=%r',
+                file_obj.get('id'),
+            )
+            continue
+        size_hint = file_obj.get('size')
+        if size_hint is not None:
+            try:
+                if int(size_hint) > max_per:
+                    logger.warning(
+                        'Skipping Slack attachment %r: declared size exceeds per-file limit',
+                        file_obj.get('name'),
+                    )
+                    continue
+            except (TypeError, ValueError):
+                pass
+        blob = _read_slack_private_url(url, bot_token, max_per)
+        if not blob:
+            continue
+        if total_bytes + len(blob) > max_total:
+            logger.warning('Slack input files: total byte limit %d reached', max_total)
+            break
+        base = _sanitize_slack_attachment_filename(str(file_obj.get('name') or 'attached'))
+        candidate = base
+        n = 2
+        while candidate in used_names:
+            root, ext = os.path.splitext(base)
+            candidate = f'{root}_{n}{ext}'
+            n += 1
+        used_names.add(candidate)
+        dest_path = os.path.join(input_dir, candidate)
+        try:
+            with open(dest_path, 'wb') as out_fp:
+                out_fp.write(blob)
+        except OSError:
+            logger.warning('Failed to write Slack input file %s', dest_path, exc_info=True)
+            continue
+        total_bytes += len(blob)
+        saved.append(f'{WORKSPACE_INPUT_SUBDIR}/{candidate}'.replace(os.sep, '/'))
+
+    return saved
+
+
 def _progress_waiting_text(elapsed_sec: int, timeout_sec: int) -> str:
     """Claude 실행 중 Slack 대기 메시지: 경과/최대 대기(초)."""
     return f'⏳ 처리 중… {elapsed_sec}s/{timeout_sec}s'
@@ -266,14 +397,18 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
     workspace = f'/tmp/claude-sandbox/{thread_ts}'
     os.makedirs(workspace, exist_ok=True)
     output_dir = os.path.join(workspace, WORKSPACE_OUTPUT_SUBDIR)
+    input_dir = os.path.join(workspace, WORKSPACE_INPUT_SUBDIR)
     os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(input_dir, exist_ok=True)
     try:
         os.chown(workspace, CLAUDE_CONTAINER_UID, CLAUDE_CONTAINER_GID)
         os.chown(output_dir, CLAUDE_CONTAINER_UID, CLAUDE_CONTAINER_GID)
+        os.chown(input_dir, CLAUDE_CONTAINER_UID, CLAUDE_CONTAINER_GID)
     except OSError:
         try:
             os.chmod(workspace, 0o777)
             os.chmod(output_dir, 0o777)
+            os.chmod(input_dir, 0o777)
         except OSError:
             logger.warning(
                 'Could not chown/chmod workspace %s for container UID',
@@ -282,10 +417,21 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
             )
 
     try:
-        if context:
-            prompt = f'## 이전 대화\n{context}\n\n## 현재 요청\n{request}'
+        input_relpaths = download_slack_message_files_to_input(event, workspace, SLACK_BOT_TOKEN)
+        if input_relpaths:
+            lines = '\n'.join(f'- `/workspace/{p}`' for p in input_relpaths)
+            input_note = (
+                '## 이번 Slack 메시지 첨부\n'
+                '아래 파일은 이번 사용자 메시지에 붙은 첨부를 봇이 복사해 둔 것이다. '
+                '필요하면 읽어서 활용할 것.\n'
+                f'{lines}\n\n'
+            )
         else:
-            prompt = f'## 현재 요청\n{request}'
+            input_note = ''
+        if context:
+            prompt = f'{input_note}## 이전 대화\n{context}\n\n## 현재 요청\n{request}'
+        else:
+            prompt = f'{input_note}## 현재 요청\n{request}'
 
         cmd = [
             '/usr/bin/docker',
@@ -432,6 +578,13 @@ def handle_request(event: dict, client):
     thread_ts = event.get('thread_ts') or event.get('ts')
     msg_id = event.get('client_msg_id') or event.get('ts')
     user_request = event.get('text', '').replace(f'<@{BOT_USER_ID}>', '').strip()
+    has_slack_files = bool(event.get('files'))
+
+    if not user_request and not has_slack_files:
+        return
+
+    if not user_request and has_slack_files:
+        user_request = '(이 메시지에는 텍스트가 없고 Slack 첨부만 있다. `/workspace/input/`의 파일을 읽고 처리해 달라.)'
 
     msg_type = 'DM' if is_dm else 'mention'
     logger.info(
@@ -450,9 +603,6 @@ def handle_request(event: dict, client):
             client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=TEAM_ACCESS_DENIED_TEXT)
         except Exception:
             logger.exception('Failed to post team access denied message')
-        return
-
-    if not user_request:
         return
 
     waiting_msg = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text='⏳ 처리 중...')
@@ -517,7 +667,8 @@ def on_mention(event, client):
 def on_dm(event, client):
     if event.get('channel_type') != 'im':
         return
-    if event.get('subtype'):
+    subtype = event.get('subtype')
+    if subtype and subtype not in SLACK_DM_ALLOWED_FILE_MESSAGE_SUBTYPES:
         return
     if event.get('bot_id'):
         return
