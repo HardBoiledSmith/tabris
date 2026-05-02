@@ -254,12 +254,9 @@ def post_workspace_artifacts_to_thread(client, channel: str, thread_ts: str, wor
             logger.warning('files_upload_v2 failed for %s', rel_name, exc_info=True)
 
 
-def _progress_waiting_text(elapsed_sec: int, is_silent: bool = False) -> str:
-    """Claude 실행 중 Slack 대기 메시지 텍스트 (텍스트 출력 모드에서는 경과 시간만 표시)."""
-    header = f'⏳ 처리 중... ({elapsed_sec}s 경과)'
-    if is_silent:
-        return f'{header}\n응답 대기 중…'
-    return header
+def _progress_waiting_text(elapsed_sec: int, timeout_sec: int) -> str:
+    """Claude 실행 중 Slack 대기 메시지: 경과/최대 대기(초)."""
+    return f'⏳ 처리 중… {elapsed_sec}s/{timeout_sec}s'
 
 
 def run_claude(event: dict, context: str, request: str, progress_callback=None) -> str:
@@ -364,10 +361,8 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
         stderr_thread.start()
 
         started_at = time.time()
-        last_activity_at = started_at
         last_progress_at = started_at
         progress_interval_sec = 10
-        silent_notice_sec = 60
 
         while True:
             now = time.time()
@@ -383,15 +378,13 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
                     stdout_chunks.append(chunk)
                 else:
                     stderr_chunks.append(chunk)
-                last_activity_at = now
             except queue.Empty:
                 pass
 
             now = time.time()
             elapsed = int(now - started_at)
             if progress_callback and now - last_progress_at >= progress_interval_sec:
-                idle_long = now - last_activity_at >= silent_notice_sec
-                progress_callback(_progress_waiting_text(elapsed, is_silent=idle_long))
+                progress_callback(_progress_waiting_text(elapsed, CLAUDE_TIMEOUT))
                 last_progress_at = now
 
             if process.poll() is not None and output_queue.empty():
