@@ -87,6 +87,26 @@ def _normalize_slack_team_id(raw):
     return str(raw).strip() or None
 
 
+def _enrich_event_team_id_for_acl(event: dict, context) -> dict:
+    """이벤트에 팀 식별자가 없으면 Bolt `context`의 워크스페이스 ID를 `team_id`로 넣은 사본을 돌려준다.
+
+    `subtype: file_share` 등 일부 `message` 페이로드는 `team_id`/`team`이 빠져
+    `is_allowed_slack_team`이 거부되는 경우가 있다. Socket Mode에서 Bolt가 채운
+    `context.team_id`를 보강한다.
+    """
+
+    if _normalize_slack_team_id(event.get('team_id') or event.get('team')):
+        return event
+    if context is None:
+        return event
+    tid = context.team_id or context.actor_team_id
+    if not tid:
+        return event
+    merged = dict(event)
+    merged['team_id'] = tid
+    return merged
+
+
 def is_allowed_slack_team(event: dict) -> bool:
     """메시지가 발생한 Slack 워크스페이스(team)가 ALLOWED_TEAM_ID와 일치하는지 본다.
 
@@ -649,8 +669,9 @@ def handle_request(event: dict, client):
         shutil.rmtree(workspace, ignore_errors=True)
 
 
-def _submit(event, client):
-    future = executor.submit(handle_request, event, client)
+def _submit(event, client, context=None):
+    event_for_worker = _enrich_event_team_id_for_acl(event, context)
+    future = executor.submit(handle_request, event_for_worker, client)
     future.add_done_callback(
         lambda f: (
             logger.exception('handle_request raised an exception', exc_info=f.exception()) if f.exception() else None
@@ -659,12 +680,12 @@ def _submit(event, client):
 
 
 @app.event('app_mention')
-def on_mention(event, client):
-    _submit(event, client)
+def on_mention(event, client, context=None):
+    _submit(event, client, context)
 
 
 @app.event('message')
-def on_dm(event, client):
+def on_dm(event, client, context=None):
     if event.get('channel_type') != 'im':
         return
     subtype = event.get('subtype')
@@ -672,7 +693,7 @@ def on_dm(event, client):
         return
     if event.get('bot_id'):
         return
-    _submit(event, client)
+    _submit(event, client, context)
 
 
 if __name__ == '__main__':

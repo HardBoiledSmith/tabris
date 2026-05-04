@@ -111,8 +111,8 @@ def test_download_duplicate_names_get_suffix(tmp_path, monkeypatch):
 def test_on_dm_file_share_calls_submit(monkeypatch):
     called = []
 
-    def fake_submit(event, client):
-        called.append((event, client))
+    def fake_submit(event, client, context=None):
+        called.append((event, client, context))
 
     monkeypatch.setattr(run_server, '_submit', fake_submit)
     run_server.on_dm(
@@ -127,10 +127,28 @@ def test_on_dm_file_share_calls_submit(monkeypatch):
     assert len(called) == 1
 
 
+def test_enrich_event_team_id_from_context():
+    event = {'subtype': 'file_share', 'channel': 'D1', 'user': 'U1'}
+    ctx = MagicMock()
+    ctx.team_id = 'T_ALLOWED'
+    ctx.actor_team_id = None
+    out = run_server._enrich_event_team_id_for_acl(event, ctx)
+    assert out['team_id'] == 'T_ALLOWED'
+    assert 'team_id' not in event
+
+
+def test_enrich_event_noop_when_team_present():
+    event = {'team_id': 'T_ALLOWED', 'channel': 'D1'}
+    ctx = MagicMock()
+    ctx.team_id = 'T_OTHER'
+    out = run_server._enrich_event_team_id_for_acl(event, ctx)
+    assert out is event
+
+
 def test_on_dm_unknown_subtype_skips(monkeypatch):
     called = []
 
-    monkeypatch.setattr(run_server, '_submit', lambda e, c: called.append(True))
+    monkeypatch.setattr(run_server, '_submit', lambda e, c, context=None: called.append(True))
     run_server.on_dm(
         {
             'channel_type': 'im',

@@ -152,6 +152,29 @@ def test_dm_with_subtype_is_ignored(run_server_module, slack_client, monkeypatch
     slack_client.chat_postMessage.assert_not_called()
 
 
+def test_dm_file_share_without_event_team_id_enriches_from_context(run_server_module, slack_client, fake_claude_ok):
+    """일부 DM(file_share 등)은 event에 team_id가 없어도 Bolt context로 ACL 통과한다."""
+    fake_claude_ok('처리 완료')
+
+    event = {
+        'type': 'message',
+        'channel_type': 'im',
+        'channel': 'D123',
+        'user': 'U_USER',
+        'subtype': 'file_share',
+        'ts': '1700000000.000099',
+        'text': '이 파일로 재시도 해줘',
+        'files': [],
+    }
+    ctx = MagicMock()
+    ctx.team_id = 'T_ALLOWED'
+    ctx.actor_team_id = None
+
+    run_server_module.on_dm(event, slack_client, ctx)
+
+    assert slack_client.chat_update.called
+
+
 def test_thread_history_is_passed_to_claude(run_server_module, slack_client, monkeypatch):
     """스레드에 이전 대화가 있으면 Claude에 전달되는 프롬프트에 포함된다."""
     slack_client.conversations_replies.return_value = {
