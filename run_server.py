@@ -40,8 +40,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 ARTIFACT_MAX_FILES = 10
-ARTIFACT_MAX_BYTES_PER_FILE = 1_048_576  # 1 MiB
-ARTIFACT_MAX_TOTAL_BYTES = 5_242_880  # 5 MiB
+ARTIFACT_MAX_BYTES_PER_FILE = 1_073_741_824  # 1 GiB
+ARTIFACT_MAX_TOTAL_BYTES = 5_368_709_120  # 5 GiB
 # Slack 파일 업로드는 이 하위만 스캔한다. 중간 산출은 컨테이너 `/tmp` 등에 두도록 CLAUDE.md로 안내한다.
 WORKSPACE_OUTPUT_SUBDIR = 'output'
 # 트리거 메시지의 Slack 첨부만 호스트가 받아 컨테이너 `/workspace/input/`에 둔다.
