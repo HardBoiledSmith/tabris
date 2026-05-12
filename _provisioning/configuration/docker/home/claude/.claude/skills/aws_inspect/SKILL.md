@@ -56,6 +56,42 @@ echo "✅ AWS CLI 및 환경 변수 자격 증명 확인 완료"
 
 대상 계정을 모르는 경우, Step 3에서 OrchestratorRole을 assume한 뒤 Organizations 목록을 먼저 조회하여 사용자에게 선택하게 한다.
 
+## Step 2.5: Fast Path 검사 (조기 분기)
+
+아래 화이트리스트에 모두 매치되면 role chain을 건너뛰고 환경 변수 자격 증명으로 바로 실행한다.
+
+**허용 대상 (billing 계정 591379657681):**
+- 버킷: `hbsmith-tabris-documents` 단 하나
+- 허용 명령 (read-only, 다운로드/조회만):
+  - `aws s3 ls s3://hbsmith-tabris-documents[/...]`
+  - `aws s3 cp s3://hbsmith-tabris-documents/<key> <로컬경로>` (다운로드 방향만)
+  - `aws s3api list-objects` / `list-objects-v2` / `list-object-versions` (`--bucket hbsmith-tabris-documents`)
+  - `aws s3api get-object` (`--bucket hbsmith-tabris-documents`)
+  - `aws s3api head-object` / `head-bucket` / `get-bucket-location` (`--bucket hbsmith-tabris-documents`)
+
+**Fast Path 비적용 (= 기존 chain으로 진행):**
+- 다른 버킷, 다른 계정
+- write 계열 (`cp` 업로드 방향, `sync` 업로드, `mv`, `rm`, `put-*`, `delete-*` 등)
+- 위 화이트리스트에 없는 verb (예: `s3api list-buckets`)
+
+**Fast Path 실행:**
+
+`--profile`을 쓰지 않는다. 이미 설정된 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / (선택) `AWS_SESSION_TOKEN`을 그대로 사용한다.
+
+```bash
+aws <허용된 명령> --no-paginate --output json
+```
+
+실행이 권한 오류(`AccessDenied` 등)로 실패하면 fast path를 포기하고 Step 3부터 chain으로 재시도한다. 그 외 오류는 즉시 중단하고 보고한다.
+
+성공 시 Step 7 (결과 보고)로 직행하며, Chain 표기는 다음과 같이 한다:
+
+```
+- Chain: 환경 변수 자격 증명 (fast path, role chain 우회)
+```
+
+화이트리스트 미스 → Step 3으로 진행.
+
 ## Step 3: Chain Step 1 — 환경 변수 자격 증명 → OrchestratorRole
 
 `--profile`을 쓰지 않는다. 이미 설정된 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / (선택) `AWS_SESSION_TOKEN`이 첫 `assume-role`에 사용된다.
