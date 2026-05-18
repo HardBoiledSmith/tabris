@@ -14,44 +14,76 @@ Slack Bolt (Socket Mode) 기반 봇. 사용자의 멘션/DM에 응답하여 Dock
 
 [api.slack.com/apps](https://api.slack.com/apps) 에서 진행.
 
-### ① App 생성
-- **Create New App** → **From scratch** → App Name: `tabris`, Workspace 선택.
+### ① 앱 생성 (App Manifest)
+새 워크스페이스에 앱을 만들 때는 아래 매니페스트로 한 번에 설정한다. (봇 표시명·OAuth 스코프·`app_mention` / `message.im` 구독·Socket Mode·Interactivity 등이 포함된다.)
 
-### ② Socket Mode 활성화
-- 좌측 메뉴 **Socket Mode** → Enable Socket Mode = **On**.
-- App-Level Token 생성: Token Name `tabris-socket`, Scope `connections:write`.
+1. **Create New App** → **From an app manifest** → 대상 Workspace 선택.
+2. 아래 JSON을 붙여넣고 **Next** → 내용 확인 후 **Create**.
+3. 생성 후 좌측 **App Manifest**에서 동일 JSON이 반영됐는지 확인. 스코프·이벤트를 바꿨다면 이후 **Reinstall to Workspace**가 필요하다.
+
+```json
+{
+    "display_information": {
+        "name": "HBsmith Tabris Bot",
+        "description": "HBsmith 업무 자동화를 위한 AI Agent",
+        "background_color": "#121212"
+    },
+    "features": {
+        "bot_user": {
+            "display_name": "tabris",
+            "always_online": true
+        }
+    },
+    "oauth_config": {
+        "scopes": {
+            "bot": [
+                "files:write",
+                "app_mentions:read",
+                "channels:history",
+                "channels:read",
+                "chat:write",
+                "files:read",
+                "groups:history",
+                "groups:read",
+                "im:history",
+                "users:read"
+            ]
+        },
+        "pkce_enabled": true
+    },
+    "settings": {
+        "event_subscriptions": {
+            "bot_events": [
+                "app_mention",
+                "message.im"
+            ]
+        },
+        "interactivity": {
+            "is_enabled": true
+        },
+        "org_deploy_enabled": false,
+        "socket_mode_enabled": true,
+        "token_rotation_enabled": false,
+        "is_mcp_enabled": false
+    }
+}
+```
+
+### ② Socket Mode App-Level Token
+매니페스트로 Socket Mode는 켜지지만, 연결용 **App-Level Token**은 별도로 발급한다.
+
+- 좌측 **Socket Mode** → **Generate Token** (또는 App-Level Tokens).
+- Token Name: `tabris-socket`, Scope: `connections:write`.
 - 발급된 `xapp-...` 토큰을 `SLACK_APP_TOKEN`에 사용.
 
-### ③ OAuth & Permissions — Bot Token Scopes
-`run_server.py`가 호출하는 API에 필요한 최소 스코프:
-
-| 스코프 | 필요 이유 |
-|--------|-----------|
-| `app_mentions:read` | `@app.event("app_mention")` — 멘션 수신 |
-| `chat:write` | `client.chat_postMessage`, `client.chat_update` |
-| `channels:history` | 공개 채널 스레드 히스토리 (`conversations.replies`) |
-| `groups:history` | 프라이빗 채널 스레드 |
-| `im:history` | DM 메시지 및 스레드 |
-| `mpim:history` | 그룹 DM 스레드 |
-| `im:read` | DM 채널 메타데이터 |
-| `files:read` | 사용자 메시지에 붙은 첨부의 비공개 다운로드 URL(`url_private_download` 등)로 받아 `/workspace/input/`에 둠 |
-| `files:write` | `/workspace/output/`에 둔 최종 산출 파일만 스레드에 `files.upload` API로 업로드 |
-
-### ④ Event Subscriptions
-- Enable Events = **On**.
-- Subscribe to bot events:
-  - `app_mention` — 멘션 수신 (`on_mention`)
-  - `message.im` — DM 수신 (`on_dm`)
-- Socket Mode이므로 Request URL 입력 불필요.
-
-### ⑤ Install to Workspace
+### ③ Install to Workspace
 - **Install App** → 설치 → `xoxb-...` 봇 토큰 발급 → `SLACK_BOT_TOKEN`에 사용.
 - 스코프 변경 시 반드시 **Reinstall to Workspace** 재실행 후 토큰 갱신.
 
-### ⑥ Bot User ID 확인
+### ④ Bot User ID 확인
 - Slack 클라이언트에서 봇 프로필 클릭 → **Copy member ID** (`U...`) → `BOT_USER_ID`.
 
-### ⑦ 채널 초대
+### ⑤ 채널 초대
 - 봇이 응답할 채널에서 `/invite @tabris`.
 - DM은 초대 불필요 (워크스페이스 설치 시점부터 가능).
 
