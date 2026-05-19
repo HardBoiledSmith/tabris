@@ -1,3 +1,4 @@
+import base64
 import logging
 import os
 import queue
@@ -35,6 +36,9 @@ from settings_local import NERV_MCP_TOKEN
 from settings_local import SENTRY_AUTH_TOKEN
 from settings_local import SLACK_APP_TOKEN
 from settings_local import SLACK_BOT_TOKEN
+
+# Atlassian MCP Basic auth: echo -n "user:api_key" | base64
+ATLASSIAN_ROVO_MCP_TOKEN = base64.b64encode(f'{JIRA_API_USERNAME}:{JIRA_API_KEY}'.encode()).decode('ascii')
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -476,9 +480,7 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
             '-e',
             f'AWS_DEFAULT_REGION={AWS_DEFAULT_REGION}',
             '-e',
-            f'JIRA_API_KEY={JIRA_API_KEY}',
-            '-e',
-            f'JIRA_API_USERNAME={JIRA_API_USERNAME}',
+            f'ATLASSIAN_ROVO_MCP_TOKEN={ATLASSIAN_ROVO_MCP_TOKEN}',
             '-e',
             f'SLACK_BOT_TOKEN={SLACK_BOT_TOKEN}',
             '-e',
