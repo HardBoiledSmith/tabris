@@ -1,4 +1,5 @@
 import base64
+import json
 import logging
 import os
 import queue
@@ -23,9 +24,6 @@ from const import TEAM_ACCESS_DENIED_TEXT
 sys.path.append('/etc/tabris')
 from settings_local import ALLOWED_TEAM_ID
 from settings_local import ANTHROPIC_API_KEY
-from settings_local import AWS_ACCESS_KEY_ID
-from settings_local import AWS_DEFAULT_REGION
-from settings_local import AWS_SECRET_ACCESS_KEY
 from settings_local import BOT_USER_ID
 from settings_local import CLAUDE_TIMEOUT
 from settings_local import DOCKER_IMAGE
@@ -58,6 +56,10 @@ CLAUDE_CONFIG_IN_CONTAINER = '/home/claude/.claude.json'
 # Dockerfile `useradd -u 1001 claude`와 동기화. 바인드 마운트는 호스트 inode 권한을 따른다.
 CLAUDE_CONTAINER_UID = 1001
 CLAUDE_CONTAINER_GID = 1001
+
+EC2_IMDS_BASE = 'http://169.254.169.254/latest'
+EC2_IMDS_TOKEN_TTL_SECONDS = '21600'
+AWS_DEFAULT_REGION = 'ap-northeast-2'
 
 app = App(token=SLACK_BOT_TOKEN)
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
@@ -414,6 +416,46 @@ def _progress_waiting_text(elapsed_sec: int, timeout_sec: int) -> str:
     return f'⏳ 처리 중… {elapsed_sec}s/{timeout_sec}s'
 
 
+def fetch_ec2_instance_role_credentials() -> dict[str, str]:
+    """EC2 IMDSv2로 인스턴스 프로파일(IAM role)의 임시 AWS 자격증명을 조회한다."""
+
+    token_req = urllib.request.Request(
+        f'{EC2_IMDS_BASE}/api/token',
+        method='PUT',
+        headers={'X-aws-ec2-metadata-token-ttl-seconds': EC2_IMDS_TOKEN_TTL_SECONDS},
+    )
+    with urllib.request.urlopen(token_req, timeout=5) as token_resp:
+        imds_token = token_resp.read().decode('utf-8').strip()
+
+    imds_headers = {'X-aws-ec2-metadata-token': imds_token}
+    role_req = urllib.request.Request(
+        f'{EC2_IMDS_BASE}/meta-data/iam/security-credentials/',
+        headers=imds_headers,
+        method='GET',
+    )
+    with urllib.request.urlopen(role_req, timeout=5) as role_resp:
+        role_name = role_resp.read().decode('utf-8').strip().splitlines()[0].strip()
+    if not role_name:
+        raise RuntimeError('EC2 IMDS: IAM role name is empty')
+
+    creds_req = urllib.request.Request(
+        f'{EC2_IMDS_BASE}/meta-data/iam/security-credentials/{role_name}',
+        headers=imds_headers,
+        method='GET',
+    )
+    with urllib.request.urlopen(creds_req, timeout=5) as creds_resp:
+        payload = json.loads(creds_resp.read().decode('utf-8'))
+
+    if payload.get('Code') != 'Success':
+        raise RuntimeError(f'EC2 IMDS: credential response Code={payload.get("Code")!r}')
+
+    return {
+        'AWS_ACCESS_KEY_ID': payload['AccessKeyId'],
+        'AWS_SECRET_ACCESS_KEY': payload['SecretAccessKey'],
+        'AWS_SESSION_TOKEN': payload['Token'],
+    }
+
+
 def run_claude(event: dict, context: str, request: str, progress_callback=None) -> str:
     thread_ts = event.get('thread_ts') or event.get('ts')
     msg_id = event.get('client_msg_id') or event.get('ts')
@@ -457,6 +499,12 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
         else:
             prompt = f'{input_note}## 현재 요청\n{request}'
 
+        try:
+            aws_creds = fetch_ec2_instance_role_credentials()
+        except (OSError, urllib.error.HTTPError, urllib.error.URLError, RuntimeError, KeyError) as exc:
+            logger.exception('Failed to fetch EC2 instance role credentials from IMDS')
+            return f'⚠️ AWS 자격증명 조회 실패(IMDS): {exc}'
+
         cmd = [
             '/usr/bin/docker',
             'run',
@@ -474,9 +522,11 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
             '-e',
             f'ANTHROPIC_API_KEY={ANTHROPIC_API_KEY}',
             '-e',
-            f'AWS_ACCESS_KEY_ID={AWS_ACCESS_KEY_ID}',
+            f'AWS_ACCESS_KEY_ID={aws_creds["AWS_ACCESS_KEY_ID"]}',
             '-e',
-            f'AWS_SECRET_ACCESS_KEY={AWS_SECRET_ACCESS_KEY}',
+            f'AWS_SECRET_ACCESS_KEY={aws_creds["AWS_SECRET_ACCESS_KEY"]}',
+            '-e',
+            f'AWS_SESSION_TOKEN={aws_creds["AWS_SESSION_TOKEN"]}',
             '-e',
             f'AWS_DEFAULT_REGION={AWS_DEFAULT_REGION}',
             '-e',

@@ -13,9 +13,6 @@ def _install_settings_local_stub() -> None:
     m = types.ModuleType('settings_local')
     m.ALLOWED_TEAM_ID = 'T_ALLOWED'
     m.ANTHROPIC_API_KEY = 'sk-test'
-    m.AWS_ACCESS_KEY_ID = 'aws-ak-test'
-    m.AWS_DEFAULT_REGION = 'ap-northeast-2'
-    m.AWS_SECRET_ACCESS_KEY = 'aws-sk-test'
     m.BOT_USER_ID = 'UBOT'
     m.CLAUDE_TIMEOUT = 30
     m.DOCKER_IMAGE = 'test-image'
@@ -51,6 +48,21 @@ def _sync_submit(fn, *args, **kwargs):
     except BaseException as exc:
         future.set_exception(exc)
     return future
+
+
+@pytest.fixture(autouse=True)
+def _mock_ec2_imds_credentials(monkeypatch):
+    """EC2 IMDS 없이도 Docker 실행 경로가 동작하도록 임시 자격증명을 고정한다."""
+
+    monkeypatch.setattr(
+        run_server,
+        'fetch_ec2_instance_role_credentials',
+        lambda: {
+            'AWS_ACCESS_KEY_ID': 'aws-ak-test',
+            'AWS_SECRET_ACCESS_KEY': 'aws-sk-test',
+            'AWS_SESSION_TOKEN': 'aws-st-test',
+        },
+    )
 
 
 @pytest.fixture(autouse=True)
