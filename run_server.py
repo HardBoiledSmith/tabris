@@ -30,6 +30,9 @@ from settings_local import DOCKER_IMAGE
 from settings_local import JIRA_API_KEY
 from settings_local import JIRA_API_USERNAME
 from settings_local import MAX_WORKERS
+from settings_local import MEMORY_S3_BUCKET
+from settings_local import MEMORY_S3_SYNC_ENABLED
+from settings_local import MEMORY_S3_SYNC_TIMEOUT
 from settings_local import NERV_MCP_TOKEN
 from settings_local import SENTRY_AUTH_TOKEN
 from settings_local import SLACK_APP_TOKEN
@@ -60,6 +63,27 @@ CLAUDE_CONTAINER_GID = 1001
 EC2_IMDS_BASE = 'http://169.254.169.254/latest'
 EC2_IMDS_TOKEN_TTL_SECONDS = '21600'
 AWS_DEFAULT_REGION = 'ap-northeast-2'
+
+# 사용자별 Claude memory 호스트 경로. runs/는 스레드별 임시 workspace.
+SANDBOX_ROOT = '/tmp/claude-sandbox'
+SANDBOX_USERS_DIR = f'{SANDBOX_ROOT}/users'
+SANDBOX_RUNS_DIR = f'{SANDBOX_ROOT}/runs'
+WORKSPACE_MEMORY_SUBDIR = 'memory'
+# workdir이 /workspace이므로 Claude Code 프로젝트 ID는 -workspace.
+CLAUDE_MEMORY_CONTAINER_PATH = '/home/claude/.claude/projects/-workspace/memory'
+
+# 사용자별 memory S3 sync 직렬화용 lock.
+_user_memory_locks: dict[str, threading.Lock] = {}
+_user_memory_locks_guard = threading.Lock()
+
+
+def _user_memory_lock(user_id: str) -> threading.Lock:
+    """user_id별 threading.Lock을 반환한다. 없으면 생성."""
+    with _user_memory_locks_guard:
+        if user_id not in _user_memory_locks:
+            _user_memory_locks[user_id] = threading.Lock()
+        return _user_memory_locks[user_id]
+
 
 app = App(token=SLACK_BOT_TOKEN)
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
@@ -456,34 +480,93 @@ def fetch_ec2_instance_role_credentials() -> dict[str, str]:
     }
 
 
+def _aws_cli_executable() -> str:
+    """호스트에 설치된 aws CLI 경로를 반환한다."""
+    path = shutil.which('aws')
+    if path:
+        return path
+    return '/usr/bin/aws'
+
+
+def _memory_dir_has_files(memory_dir: str) -> bool:
+    """memory_dir 아래 일반 파일이 하나라도 있으면 True."""
+    for _root, _dirs, files in os.walk(memory_dir):
+        if files:
+            return True
+    return False
+
+
+def _aws_s3_sync(src: str, dst: str, creds: dict, *, delete: bool = False) -> None:
+    """aws s3 sync로 src → dst를 동기화한다. delete=True이면 dst에서 src에 없는 객체를 제거한다."""
+    env = os.environ.copy()
+    env['AWS_ACCESS_KEY_ID'] = creds['AWS_ACCESS_KEY_ID']
+    env['AWS_SECRET_ACCESS_KEY'] = creds['AWS_SECRET_ACCESS_KEY']
+    env['AWS_SESSION_TOKEN'] = creds['AWS_SESSION_TOKEN']
+    env['AWS_DEFAULT_REGION'] = AWS_DEFAULT_REGION
+    cmd = [_aws_cli_executable(), 's3', 'sync', src, dst, '--only-show-errors']
+    if delete:
+        cmd.append('--delete')
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=MEMORY_S3_SYNC_TIMEOUT, check=False)
+    if result.returncode != 0:
+        logger.error('aws s3 sync failed: src=%s dst=%s stderr=%s', src, dst, result.stderr[:500])
+        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
+
+
+def sync_memory_from_s3(user_id: str, memory_dir: str, creds: dict) -> None:
+    """S3 → 로컬 memory 디렉터리로 동기화한다. MEMORY_S3_SYNC_ENABLED=False면 no-op."""
+    if not MEMORY_S3_SYNC_ENABLED:
+        return
+    s3_uri = f's3://{MEMORY_S3_BUCKET}/users/{user_id}/'
+    logger.info('Syncing memory from S3: %s -> %s', s3_uri, memory_dir)
+    _aws_s3_sync(s3_uri, memory_dir, creds)
+
+
+def sync_memory_to_s3(user_id: str, memory_dir: str, creds: dict) -> None:
+    """로컬 memory → S3 미러 동기화. 로컬에 없는 S3 객체는 --delete로 제거한다."""
+    if not MEMORY_S3_SYNC_ENABLED:
+        return
+    if not _memory_dir_has_files(memory_dir):
+        logger.warning('Skipping memory upload: empty memory_dir for user %s', user_id)
+        return
+    s3_uri = f's3://{MEMORY_S3_BUCKET}/users/{user_id}/'
+    logger.info('Syncing memory to S3: %s -> %s', memory_dir, s3_uri)
+    _aws_s3_sync(memory_dir, s3_uri, creds, delete=True)
+
+
 def run_claude(event: dict, context: str, request: str, progress_callback=None) -> str:
     thread_ts = event.get('thread_ts') or event.get('ts')
     msg_id = event.get('client_msg_id') or event.get('ts')
     is_dm = event.get('channel_type') == 'im'
-    workspace = f'/tmp/claude-sandbox/{thread_ts}'
-    os.makedirs(workspace, exist_ok=True)
-    output_dir = os.path.join(workspace, WORKSPACE_OUTPUT_SUBDIR)
-    input_dir = os.path.join(workspace, WORKSPACE_INPUT_SUBDIR)
+    slack_user_id = event.get('user')
+    if not slack_user_id:
+        logger.error('run_claude: event missing user ID')
+        return '⚠️ Slack user ID 없음: 요청을 처리할 수 없습니다.'
+
+    run_workspace = f'{SANDBOX_RUNS_DIR}/{thread_ts}'
+    os.makedirs(run_workspace, exist_ok=True)
+    output_dir = os.path.join(run_workspace, WORKSPACE_OUTPUT_SUBDIR)
+    input_dir = os.path.join(run_workspace, WORKSPACE_INPUT_SUBDIR)
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(input_dir, exist_ok=True)
-    try:
-        os.chown(workspace, CLAUDE_CONTAINER_UID, CLAUDE_CONTAINER_GID)
-        os.chown(output_dir, CLAUDE_CONTAINER_UID, CLAUDE_CONTAINER_GID)
-        os.chown(input_dir, CLAUDE_CONTAINER_UID, CLAUDE_CONTAINER_GID)
-    except OSError:
+
+    memory_dir = f'{SANDBOX_USERS_DIR}/{slack_user_id}/{WORKSPACE_MEMORY_SUBDIR}'
+    os.makedirs(memory_dir, exist_ok=True)
+
+    for path in (run_workspace, output_dir, input_dir, memory_dir):
         try:
-            os.chmod(workspace, 0o777)
-            os.chmod(output_dir, 0o777)
-            os.chmod(input_dir, 0o777)
+            os.chown(path, CLAUDE_CONTAINER_UID, CLAUDE_CONTAINER_GID)
         except OSError:
-            logger.warning(
-                'Could not chown/chmod workspace %s for container UID',
-                workspace,
-                exc_info=True,
-            )
+            try:
+                os.chmod(path, 0o777)
+            except OSError:
+                logger.warning(
+                    'Could not chown/chmod %s for container UID',
+                    path,
+                    exc_info=True,
+                )
 
     try:
-        input_relpaths = download_slack_message_files_to_input(event, workspace, SLACK_BOT_TOKEN)
+        input_relpaths = download_slack_message_files_to_input(event, run_workspace, SLACK_BOT_TOKEN)
         if input_relpaths:
             lines = '\n'.join(f'- `/workspace/{p}`' for p in input_relpaths)
             input_note = (
@@ -505,138 +588,174 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
             logger.exception('Failed to fetch EC2 instance role credentials from IMDS')
             return f'⚠️ AWS 자격증명 조회 실패(IMDS): {exc}'
 
-        cmd = [
-            '/usr/bin/docker',
-            'run',
-            '--rm',
-            '--memory',
-            '512m',
-            '--cpus',
-            '1.0',
-            '--cap-drop',
-            'ALL',
-            '--tmpfs',
-            '/tmp',
-            '-v',
-            f'{workspace}:/workspace:rw',
-            '-e',
-            f'ANTHROPIC_API_KEY={ANTHROPIC_API_KEY}',
-            '-e',
-            f'AWS_ACCESS_KEY_ID={aws_creds["AWS_ACCESS_KEY_ID"]}',
-            '-e',
-            f'AWS_SECRET_ACCESS_KEY={aws_creds["AWS_SECRET_ACCESS_KEY"]}',
-            '-e',
-            f'AWS_SESSION_TOKEN={aws_creds["AWS_SESSION_TOKEN"]}',
-            '-e',
-            f'AWS_DEFAULT_REGION={AWS_DEFAULT_REGION}',
-            '-e',
-            f'ATLASSIAN_ROVO_MCP_TOKEN={ATLASSIAN_ROVO_MCP_TOKEN}',
-            '-e',
-            f'SLACK_BOT_TOKEN={SLACK_BOT_TOKEN}',
-            '-e',
-            f'SENTRY_AUTH_TOKEN={SENTRY_AUTH_TOKEN}',
-            '-e',
-            f'NERV_MCP_TOKEN={NERV_MCP_TOKEN}',
-            '--workdir',
-            '/workspace',
-            DOCKER_IMAGE,
-            'claude',
-            '-p',
-            prompt,
-            '--mcp-config',
-            CLAUDE_CONFIG_IN_CONTAINER,
-            '--dangerously-skip-permissions',
-            '--output-format',
-            'text',
-        ]
-
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-
-        output_queue: queue.Queue = queue.Queue()
-        stdout_chunks: list[str] = []
-        stderr_chunks: list[str] = []
-
-        def _enqueue_stream(stream, stream_name: str) -> None:
+        with _user_memory_lock(slack_user_id):
             try:
-                for line in iter(stream.readline, ''):
-                    output_queue.put((stream_name, line))
-            finally:
-                stream.close()
+                sync_memory_from_s3(slack_user_id, memory_dir, aws_creds)
+            except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired) as exc:
+                logger.exception('Failed to restore memory from S3 for user %s', slack_user_id)
+                return f'⚠️ memory 복원(S3) 실패: {exc}'
 
-        stdout_thread = threading.Thread(
-            target=_enqueue_stream,
-            args=(process.stdout, 'stdout'),
-            daemon=True,
-        )
-        stderr_thread = threading.Thread(
-            target=_enqueue_stream,
-            args=(process.stderr, 'stderr'),
-            daemon=True,
-        )
-        stdout_thread.start()
-        stderr_thread.start()
+            returncode, text_out = _run_claude_docker(
+                run_workspace, memory_dir, aws_creds, prompt, progress_callback, thread_ts, event, msg_id, is_dm
+            )
 
-        started_at = time.time()
-        last_progress_at = started_at
-        progress_interval_sec = 10
+            if returncode == 0:
+                try:
+                    sync_memory_to_s3(slack_user_id, memory_dir, aws_creds)
+                except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired):
+                    logger.exception('Failed to backup memory to S3 for user %s', slack_user_id)
+                    # Claude 응답은 그대로 반환하고 경고만 로깅한다.
 
-        while True:
-            now = time.time()
-            elapsed = int(now - started_at)
-            if elapsed > CLAUDE_TIMEOUT:
-                process.kill()
-                return f'⚠️ 작업 시간 초과 ({CLAUDE_TIMEOUT}초)'
-
-            try:
-                stream_name, chunk = output_queue.get(timeout=1)
-                now = time.time()
-                if stream_name == 'stdout':
-                    stdout_chunks.append(chunk)
-                else:
-                    stderr_chunks.append(chunk)
-            except queue.Empty:
-                pass
-
-            now = time.time()
-            elapsed = int(now - started_at)
-            if progress_callback and now - last_progress_at >= progress_interval_sec:
-                progress_callback(_progress_waiting_text(elapsed, CLAUDE_TIMEOUT))
-                last_progress_at = now
-
-            if process.poll() is not None and output_queue.empty():
-                break
-
-        stdout = ''.join(stdout_chunks)
-        stderr = ''.join(stderr_chunks)
-
-        if process.returncode != 0:
-            logger.error('Claude exited with code %d: %s', process.returncode, stderr)
-            return f'⚠️ 실행 오류:\n```{stderr[:300]}```'
-
-        text_out = stdout.strip()
-        if not text_out:
-            return '⚠️ 응답이 비어 있습니다.'
-        output_length = len(text_out)
-        logger.info(
-            '[RESPONSE] type=%s team_id=%s channel=%s thread_ts=%s user=%s msg_id=%s output_length=%d',
-            'DM' if is_dm else 'mention',
-            _normalize_slack_team_id(event.get('team_id') or event.get('team')),
-            event.get('channel'),
-            thread_ts,
-            event.get('user'),
-            msg_id,
-            output_length,
-        )
         return text_out
+
     except Exception as e:
         logger.exception('Unexpected error in run_claude')
         return f'⚠️ 오류: {e}'
+
+
+def _run_claude_docker(
+    run_workspace: str,
+    memory_dir: str,
+    aws_creds: dict,
+    prompt: str,
+    progress_callback,
+    thread_ts: str,
+    event: dict,
+    msg_id: str,
+    is_dm: bool,
+) -> tuple[int, str]:
+    """Docker 컨테이너에서 Claude를 실행하고 (returncode, output_text)를 반환한다."""
+    cmd = [
+        '/usr/bin/docker',
+        'run',
+        '--rm',
+        '--memory',
+        '512m',
+        '--cpus',
+        '1.0',
+        '--cap-drop',
+        'ALL',
+        '--tmpfs',
+        '/tmp',
+        '-v',
+        f'{run_workspace}:/workspace:rw',
+        '-v',
+        f'{memory_dir}:{CLAUDE_MEMORY_CONTAINER_PATH}:rw',
+        '-e',
+        f'ANTHROPIC_API_KEY={ANTHROPIC_API_KEY}',
+        '-e',
+        f'AWS_ACCESS_KEY_ID={aws_creds["AWS_ACCESS_KEY_ID"]}',
+        '-e',
+        f'AWS_SECRET_ACCESS_KEY={aws_creds["AWS_SECRET_ACCESS_KEY"]}',
+        '-e',
+        f'AWS_SESSION_TOKEN={aws_creds["AWS_SESSION_TOKEN"]}',
+        '-e',
+        f'AWS_DEFAULT_REGION={AWS_DEFAULT_REGION}',
+        '-e',
+        f'ATLASSIAN_ROVO_MCP_TOKEN={ATLASSIAN_ROVO_MCP_TOKEN}',
+        '-e',
+        f'SLACK_BOT_TOKEN={SLACK_BOT_TOKEN}',
+        '-e',
+        f'SENTRY_AUTH_TOKEN={SENTRY_AUTH_TOKEN}',
+        '-e',
+        f'NERV_MCP_TOKEN={NERV_MCP_TOKEN}',
+        '--workdir',
+        '/workspace',
+        DOCKER_IMAGE,
+        'claude',
+        '-p',
+        prompt,
+        '--mcp-config',
+        CLAUDE_CONFIG_IN_CONTAINER,
+        '--dangerously-skip-permissions',
+        '--output-format',
+        'text',
+    ]
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    output_queue: queue.Queue = queue.Queue()
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    def _enqueue_stream(stream, stream_name: str) -> None:
+        try:
+            for line in iter(stream.readline, ''):
+                output_queue.put((stream_name, line))
+        finally:
+            stream.close()
+
+    stdout_thread = threading.Thread(
+        target=_enqueue_stream,
+        args=(process.stdout, 'stdout'),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_enqueue_stream,
+        args=(process.stderr, 'stderr'),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    started_at = time.time()
+    last_progress_at = started_at
+    progress_interval_sec = 10
+
+    while True:
+        now = time.time()
+        elapsed = int(now - started_at)
+        if elapsed > CLAUDE_TIMEOUT:
+            process.kill()
+            return 1, f'⚠️ 작업 시간 초과 ({CLAUDE_TIMEOUT}초)'
+
+        try:
+            stream_name, chunk = output_queue.get(timeout=1)
+            if stream_name == 'stdout':
+                stdout_chunks.append(chunk)
+            else:
+                stderr_chunks.append(chunk)
+        except queue.Empty:
+            pass
+
+        now = time.time()
+        elapsed = int(now - started_at)
+        if progress_callback and now - last_progress_at >= progress_interval_sec:
+            progress_callback(_progress_waiting_text(elapsed, CLAUDE_TIMEOUT))
+            last_progress_at = now
+
+        if process.poll() is not None and output_queue.empty():
+            break
+
+    stdout = ''.join(stdout_chunks)
+    stderr = ''.join(stderr_chunks)
+
+    if process.returncode != 0:
+        logger.error('Claude exited with code %d: %s', process.returncode, stderr)
+        return process.returncode, f'⚠️ 실행 오류:\n```{stderr[:300]}```'
+
+    text_out = stdout.strip()
+    if not text_out:
+        return process.returncode, '⚠️ 응답이 비어 있습니다.'
+
+    output_length = len(text_out)
+    logger.info(
+        '[RESPONSE] type=%s team_id=%s channel=%s thread_ts=%s user=%s msg_id=%s output_length=%d',
+        'DM' if is_dm else 'mention',
+        _normalize_slack_team_id(event.get('team_id') or event.get('team')),
+        event.get('channel'),
+        thread_ts,
+        event.get('user'),
+        msg_id,
+        output_length,
+    )
+    return process.returncode, text_out
 
 
 def handle_request(event: dict, client):
@@ -694,7 +813,7 @@ def handle_request(event: dict, client):
         except Exception:
             logger.warning('Failed to post progress update', exc_info=True)
 
-    workspace = f'/tmp/claude-sandbox/{thread_ts}'
+    run_workspace = f'{SANDBOX_RUNS_DIR}/{thread_ts}'
     try:
         answer = run_claude(event, context, user_request, progress_callback=_progress_callback)
 
@@ -714,11 +833,11 @@ def handle_request(event: dict, client):
                 logger.warning('chat_update failed, falling back to new message', exc_info=True)
                 client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
 
-        post_workspace_artifacts_to_thread(client, channel, thread_ts, workspace)
+        post_workspace_artifacts_to_thread(client, channel, thread_ts, run_workspace)
     except Exception:
         logger.exception('Failed to process request', exc_info=True)
     finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+        shutil.rmtree(run_workspace, ignore_errors=True)
 
 
 def _submit(event, client, context=None):
