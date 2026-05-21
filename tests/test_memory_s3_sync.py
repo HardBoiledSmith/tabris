@@ -44,6 +44,25 @@ def test_aws_s3_sync_builds_correct_command(tmp_path):
     assert call['env']['AWS_DEFAULT_REGION'] == run_server.AWS_DEFAULT_REGION
 
 
+def test_aws_s3_sync_includes_delete_when_requested(tmp_path):
+    """delete=True이면 aws s3 sync 명령에 --delete가 포함된다."""
+    src = str(tmp_path / 'src')
+    dst = 's3://hbsmith-tabris-memory/users/UTEST/'
+    captured_cmd: list[list[str]] = []
+
+    def fake_run(cmd, env, **kwargs):
+        captured_cmd.append(cmd)
+        result = MagicMock()
+        result.returncode = 0
+        result.stderr = ''
+        return result
+
+    with patch.object(run_server.subprocess, 'run', side_effect=fake_run):
+        run_server._aws_s3_sync(src, dst, _TEST_CREDS, delete=True)
+
+    assert '--delete' in captured_cmd[0]
+
+
 def test_aws_s3_sync_raises_on_nonzero_returncode(tmp_path):
     """aws s3 sync가 0이 아닌 종료코드를 반환하면 CalledProcessError를 발생시킨다."""
     result = MagicMock()
@@ -54,6 +73,18 @@ def test_aws_s3_sync_raises_on_nonzero_returncode(tmp_path):
     with patch.object(run_server.subprocess, 'run', return_value=result):
         with pytest.raises(subprocess.CalledProcessError):
             run_server._aws_s3_sync('src/', 's3://bucket/prefix/', _TEST_CREDS)
+
+
+def test_memory_dir_has_files(tmp_path):
+    """_memory_dir_has_files는 하위 파일 존재 여부만 판별한다."""
+    empty = tmp_path / 'empty'
+    empty.mkdir()
+    assert run_server._memory_dir_has_files(str(empty)) is False
+
+    with_files = tmp_path / 'with'
+    with_files.mkdir()
+    (with_files / 'note.md').write_text('x', encoding='utf-8')
+    assert run_server._memory_dir_has_files(str(with_files)) is True
 
 
 def test_sync_memory_from_s3_noop_when_disabled(tmp_path, monkeypatch):
@@ -76,40 +107,56 @@ def test_sync_memory_to_s3_noop_when_disabled(tmp_path, monkeypatch):
     mock_run.assert_not_called()
 
 
+def test_sync_memory_to_s3_skips_empty_memory_dir(tmp_path, monkeypatch):
+    """로컬 memory가 비어 있으면 S3 업로드(sync)를 하지 않는다."""
+    monkeypatch.setattr(run_server, 'MEMORY_S3_SYNC_ENABLED', True)
+    memory_dir = str(tmp_path / 'memory')
+    memory_dir_path = tmp_path / 'memory'
+    memory_dir_path.mkdir()
+
+    with patch.object(run_server, '_aws_s3_sync') as mock_sync:
+        run_server.sync_memory_to_s3('UTEST', memory_dir, _TEST_CREDS)
+
+    mock_sync.assert_not_called()
+
+
 def test_sync_memory_from_s3_uses_correct_s3_uri(tmp_path, monkeypatch):
     """sync_memory_from_s3가 올바른 S3 URI와 로컬 경로로 sync를 호출한다."""
     monkeypatch.setattr(run_server, 'MEMORY_S3_SYNC_ENABLED', True)
     memory_dir = str(tmp_path)
-    sync_calls: list[tuple[str, str]] = []
+    sync_calls: list[tuple[str, str, bool]] = []
 
-    def fake_sync(src, dst, creds):
-        sync_calls.append((src, dst))
+    def fake_sync(src, dst, creds, *, delete=False):
+        sync_calls.append((src, dst, delete))
 
     monkeypatch.setattr(run_server, '_aws_s3_sync', fake_sync)
     run_server.sync_memory_from_s3('UTEST', memory_dir, _TEST_CREDS)
 
     assert len(sync_calls) == 1
-    src, dst = sync_calls[0]
+    src, dst, delete = sync_calls[0]
     assert src == f's3://{run_server.MEMORY_S3_BUCKET}/users/UTEST/'
     assert dst == memory_dir
+    assert delete is False
 
 
-def test_sync_memory_to_s3_uses_correct_s3_uri(tmp_path, monkeypatch):
-    """sync_memory_to_s3가 올바른 로컬 경로와 S3 URI로 sync를 호출한다."""
+def test_sync_memory_to_s3_uses_correct_s3_uri_and_delete(tmp_path, monkeypatch):
+    """sync_memory_to_s3가 로컬→S3 sync를 delete=True로 호출한다."""
     monkeypatch.setattr(run_server, 'MEMORY_S3_SYNC_ENABLED', True)
     memory_dir = str(tmp_path)
-    sync_calls: list[tuple[str, str]] = []
+    (tmp_path / 'memory.md').write_text('data', encoding='utf-8')
+    sync_calls: list[tuple[str, str, bool]] = []
 
-    def fake_sync(src, dst, creds):
-        sync_calls.append((src, dst))
+    def fake_sync(src, dst, creds, *, delete=False):
+        sync_calls.append((src, dst, delete))
 
     monkeypatch.setattr(run_server, '_aws_s3_sync', fake_sync)
     run_server.sync_memory_to_s3('UTEST', memory_dir, _TEST_CREDS)
 
     assert len(sync_calls) == 1
-    src, dst = sync_calls[0]
+    src, dst, delete = sync_calls[0]
     assert src == memory_dir
     assert dst == f's3://{run_server.MEMORY_S3_BUCKET}/users/UTEST/'
+    assert delete is True
 
 
 def test_run_claude_returns_error_when_user_missing(monkeypatch):

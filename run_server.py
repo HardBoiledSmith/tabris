@@ -488,14 +488,24 @@ def _aws_cli_executable() -> str:
     return '/usr/bin/aws'
 
 
-def _aws_s3_sync(src: str, dst: str, creds: dict) -> None:
-    """aws s3 sync로 src → dst를 동기화한다. --delete는 사용하지 않는다."""
+def _memory_dir_has_files(memory_dir: str) -> bool:
+    """memory_dir 아래 일반 파일이 하나라도 있으면 True."""
+    for _root, _dirs, files in os.walk(memory_dir):
+        if files:
+            return True
+    return False
+
+
+def _aws_s3_sync(src: str, dst: str, creds: dict, *, delete: bool = False) -> None:
+    """aws s3 sync로 src → dst를 동기화한다. delete=True이면 dst에서 src에 없는 객체를 제거한다."""
     env = os.environ.copy()
     env['AWS_ACCESS_KEY_ID'] = creds['AWS_ACCESS_KEY_ID']
     env['AWS_SECRET_ACCESS_KEY'] = creds['AWS_SECRET_ACCESS_KEY']
     env['AWS_SESSION_TOKEN'] = creds['AWS_SESSION_TOKEN']
     env['AWS_DEFAULT_REGION'] = AWS_DEFAULT_REGION
     cmd = [_aws_cli_executable(), 's3', 'sync', src, dst, '--only-show-errors']
+    if delete:
+        cmd.append('--delete')
     result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=MEMORY_S3_SYNC_TIMEOUT, check=False)
     if result.returncode != 0:
         logger.error('aws s3 sync failed: src=%s dst=%s stderr=%s', src, dst, result.stderr[:500])
@@ -512,12 +522,15 @@ def sync_memory_from_s3(user_id: str, memory_dir: str, creds: dict) -> None:
 
 
 def sync_memory_to_s3(user_id: str, memory_dir: str, creds: dict) -> None:
-    """로컬 memory 디렉터리 → S3로 동기화한다. MEMORY_S3_SYNC_ENABLED=False면 no-op."""
+    """로컬 memory → S3 미러 동기화. 로컬에 없는 S3 객체는 --delete로 제거한다."""
     if not MEMORY_S3_SYNC_ENABLED:
+        return
+    if not _memory_dir_has_files(memory_dir):
+        logger.warning('Skipping memory upload: empty memory_dir for user %s', user_id)
         return
     s3_uri = f's3://{MEMORY_S3_BUCKET}/users/{user_id}/'
     logger.info('Syncing memory to S3: %s -> %s', memory_dir, s3_uri)
-    _aws_s3_sync(memory_dir, s3_uri, creds)
+    _aws_s3_sync(memory_dir, s3_uri, creds, delete=True)
 
 
 def run_claude(event: dict, context: str, request: str, progress_callback=None) -> str:
