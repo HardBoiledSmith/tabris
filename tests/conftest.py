@@ -23,6 +23,9 @@ def _install_settings_local_stub() -> None:
     m.SENTRY_AUTH_TOKEN = 'sntrys_test'
     m.SLACK_APP_TOKEN = 'xapp-test'
     m.SLACK_BOT_TOKEN = 'xoxb-test'
+    m.MEMORY_S3_BUCKET = 'hbsmith-tabris-memory'
+    m.MEMORY_S3_SYNC_ENABLED = False
+    m.MEMORY_S3_SYNC_TIMEOUT = 60
     sys.modules['settings_local'] = m
 
 

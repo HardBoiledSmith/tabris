@@ -99,16 +99,20 @@ def test_run_claude_injects_imds_credentials_into_docker_cmd(monkeypatch):
 
     install_claude_popen_mock(monkeypatch, stdout_text='ok', returncode=0, cmd_capture=captured)
 
-    event = {'channel_type': 'im', 'ts': '1.1', 'thread_ts': '1.1'}
+    event = {'channel_type': 'im', 'ts': '1.1', 'thread_ts': '1.1', 'user': 'UTEST'}
     run_server.run_claude(event, '', 'hello')
 
     cmd = captured['cmd']
     env: dict[str, str] = {}
+    volumes: list[str] = []
     i = 0
     while i < len(cmd):
         if cmd[i] == '-e' and i + 1 < len(cmd):
             key, _, val = cmd[i + 1].partition('=')
             env[key] = val
+            i += 2
+        elif cmd[i] == '-v' and i + 1 < len(cmd):
+            volumes.append(cmd[i + 1])
             i += 2
         else:
             i += 1
@@ -116,3 +120,12 @@ def test_run_claude_injects_imds_credentials_into_docker_cmd(monkeypatch):
     assert env['AWS_SECRET_ACCESS_KEY'] == 'sk-inject'
     assert env['AWS_SESSION_TOKEN'] == 'st-inject'
     assert env['AWS_DEFAULT_REGION'] == run_server.AWS_DEFAULT_REGION
+
+    # run workspace는 runs/{thread_ts} 경로를 사용한다.
+    assert any(f'{run_server.SANDBOX_RUNS_DIR}/1.1:/workspace:rw' == v for v in volumes)
+    # 사용자별 memory 볼륨이 포함되어 있다.
+    assert any(
+        f'{run_server.SANDBOX_USERS_DIR}/UTEST/{run_server.WORKSPACE_MEMORY_SUBDIR}:{run_server.CLAUDE_MEMORY_CONTAINER_PATH}:rw'
+        == v
+        for v in volumes
+    )

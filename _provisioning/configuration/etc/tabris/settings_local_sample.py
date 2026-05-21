@@ -10,3 +10,6 @@ SLACK_APP_TOKEN = 'xapp-...'
 SLACK_BOT_TOKEN = 'xoxb-...'
 JIRA_API_KEY = '...'
 JIRA_API_USERNAME = '...'
+MEMORY_S3_BUCKET = 'hbsmith-tabris-memory'
+MEMORY_S3_SYNC_ENABLED = True
+MEMORY_S3_SYNC_TIMEOUT = 60
