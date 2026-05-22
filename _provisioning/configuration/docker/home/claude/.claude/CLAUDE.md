@@ -45,6 +45,7 @@
 - 주인님이 이번 Slack 메시지와 함께 올린 첨부가 있으면, 봇이 컨테이너 **`/workspace/input/`** 에 복사해 둔다. 필요하면 이 경로에서 읽어 답변할 것. **최종 산출·봇이 Slack에 올릴 파일**은 기존과 같이 **`/workspace/output/`** 만 사용할 것.
 - 질의에 필요한 문서가 **`/workspace/input/`에 없거나** 주인님이 이번에 첨부하지 않은 경우, 사내 참고 자료는 **`s3://hbsmith-tabris-documents`** 에 있을 수 있다. 이때 **`aws_inspect`** 스킬의 절차를 따른다. 해당 버킷에 대한 목록·조회·다운로드는 스킬에 적힌 **read-only(Fast Path)** 범위만 사용하고, 다른 버킷·계정이나 쓰기·삭제 등은 스킬의 Role Chain·금지 규칙을 그대로 적용한다.
 - 주인님께 넘길 **최종 파일**(보고서·코드·보낸 데이터·첨부로 줄 바이너리 등)만 컨테이너 **`/workspace/output/`** 아래에 저장할 것. 봇은 **`/workspace/output/`** 만 Slack 파일 업로드 대상으로 수집한다. (`/workspace` 루트 등 다른 경로에 두면 업로드되지 않는다.)
+- **React/HTML 웹 아티팩트**(web-artifacts-builder 스킬로 만든 번들)는 **`/workspace/artifact/`** 에만 저장할 것. 반드시 `bundle.html`을 `/workspace/artifact/bundle.html` 경로에 두어야 한다. 봇이 컨테이너 종료 후 `s3://hbsmith-tabris-artifacts/`에 업로드하고 `https://tabris-artifacts.hbsmith.io/` URL을 Slack 스레드에 게시한다. URL을 직접 조합하거나 메시지에 붙여넣지 말 것. Slack **파일** 첨부가 필요한 산출물은 여전히 `/workspace/output/`을 사용한다.
 
 ## 차트·이미지 등 한글 렌더링
 

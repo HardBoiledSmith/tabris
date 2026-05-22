@@ -168,10 +168,40 @@ vagrant destroy -f     # VM 완전 삭제
 | `MEMORY_S3_BUCKET` |   | `hbsmith-tabris-memory` | 사용자별 memory S3 버킷명 |
 | `MEMORY_S3_SYNC_ENABLED` |   | `True` | S3 sync 활성화 여부. 로컬·Vagrant는 `False`로 설정 |
 | `MEMORY_S3_SYNC_TIMEOUT` |   | `60` | `aws s3 sync` subprocess 타임아웃(초) |
+| `ARTIFACT_S3_BUCKET` |   | `hbsmith-tabris-artifacts` | web artifact S3 버킷명 |
+| `ARTIFACT_BASE_URL` |   | `https://tabris-artifacts.hbsmith.io` | Slack에 공유할 공개 URL prefix |
+| `ARTIFACT_S3_SYNC_ENABLED` |   | `True` | web artifact S3 업로드 활성화 여부. 로컬·Vagrant는 `False`로 설정 |
+| `ARTIFACT_S3_SYNC_TIMEOUT` |   | `60` | artifact `aws s3 sync` subprocess 타임아웃(초) |
 
 VM에서는 `/etc/tabris/settings_local.py`에 Python 상수로 정의한다. 로컬 개발 시에도 동일하게 `settings_local`를 import할 수 있는 경로에 두면 된다.
 
 ## 인프라 선행 조건 (운영 배포 시 필수)
+
+### Web Artifact 호스팅
+
+web-artifacts-builder 스킬로 생성된 `bundle.html`은 Docker 종료 후 `s3://hbsmith-tabris-artifacts/{user_id}/{unix_ts}/`에 업로드되고, CloudFront(`tabris-artifacts.hbsmith.io`)를 통해 Slack 스레드에 공개 URL로 공유된다. 인프라(S3 버킷, CloudFront 배포, Route 53 레코드)는 별도로 구축한다.
+
+**배포 시 sandbox 이미지 재빌드 필수**: `CLAUDE.md`, `web-artifacts-builder` 스킬, `bundle-artifact.sh` 변경 사항이 이미지에 반영되어야 한다.
+
+```bash
+# VM에서 코드 반영 후 이미지 재빌드
+vagrant ssh -c 'cd /opt/tabris && sudo git pull && sudo docker build -t hbsmith-claude-sandbox /opt/tabris && sudo systemctl restart tabris'
+```
+
+tabris EC2 instance profile에 아래 IAM 정책을 추가한다.
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["s3:ListBucket"],
+  "Resource": "arn:aws:s3:::hbsmith-tabris-artifacts"
+},
+{
+  "Effect": "Allow",
+  "Action": ["s3:PutObject"],
+  "Resource": "arn:aws:s3:::hbsmith-tabris-artifacts/*"
+}
+```
 
 `MEMORY_S3_SYNC_ENABLED = True`로 운영하려면 아래가 갖춰져 있어야 한다.
 

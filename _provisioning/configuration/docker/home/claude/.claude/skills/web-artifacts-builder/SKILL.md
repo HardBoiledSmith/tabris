@@ -49,7 +49,7 @@ To bundle the React app into a single HTML artifact:
 bash scripts/bundle-artifact.sh
 ```
 
-This creates `bundle.html` - a self-contained artifact with all JavaScript, CSS, and dependencies inlined. This file can be directly shared in Claude conversations as an artifact.
+This creates `bundle.html` in the project directory **and** copies it to `/workspace/artifact/bundle.html`.
 
 **Requirements**: Your project must have an `index.html` in the root directory.
 
@@ -58,10 +58,11 @@ This creates `bundle.html` - a self-contained artifact with all JavaScript, CSS,
 - Creates `.parcelrc` config with path alias support
 - Builds with Parcel (no source maps)
 - Inlines all assets into single HTML using html-inline
+- Copies the result to `/workspace/artifact/bundle.html` for S3 hosting
 
 ### Step 4: Share Artifact with User
 
-Finally, share the bundled HTML file in conversation with the user so they can view it as an artifact.
+After the container exits, the tabris bot automatically uploads `/workspace/artifact/` to S3 and posts the public URL (`https://tabris-artifacts.hbsmith.io/...`) in the Slack thread. Do not construct or post the URL yourself.
 
 ### Step 5: Testing/Visualizing the Artifact (Optional)
 
