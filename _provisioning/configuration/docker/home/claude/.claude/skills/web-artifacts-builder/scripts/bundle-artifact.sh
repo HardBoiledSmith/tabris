@@ -46,11 +46,9 @@ pnpm exec html-inline dist/index.html > bundle.html
 # Get file size
 FILE_SIZE=$(du -h bundle.html | cut -f1)
 
-# Copy to /workspace/artifact/ for S3 upload by the tabris bot
-mkdir -p /workspace/artifact
-cp -f bundle.html /workspace/artifact/bundle.html
-
 echo ""
 echo "✅ Bundle complete!"
 echo "📄 Output: bundle.html ($FILE_SIZE)"
-echo "📤 Published to /workspace/artifact/bundle.html (tabris will upload to S3 and share the URL)"
+echo ""
+echo "You can now use this single HTML file as an artifact in Claude conversations."
+echo "To test locally: open bundle.html in your browser"

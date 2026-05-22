@@ -168,40 +168,10 @@ vagrant destroy -f     # VM 완전 삭제
 | `MEMORY_S3_BUCKET` |   | `hbsmith-tabris-memory` | 사용자별 memory S3 버킷명 |
 | `MEMORY_S3_SYNC_ENABLED` |   | `True` | S3 sync 활성화 여부. 로컬·Vagrant는 `False`로 설정 |
 | `MEMORY_S3_SYNC_TIMEOUT` |   | `60` | `aws s3 sync` subprocess 타임아웃(초) |
-| `ARTIFACT_S3_BUCKET` |   | `hbsmith-tabris-artifacts` | web artifact S3 버킷명 |
-| `ARTIFACT_BASE_URL` |   | `https://tabris-artifacts.hbsmith.io` | Slack에 공유할 공개 URL prefix |
-| `ARTIFACT_S3_SYNC_ENABLED` |   | `True` | web artifact S3 업로드 활성화 여부. 로컬·Vagrant는 `False`로 설정 |
-| `ARTIFACT_S3_SYNC_TIMEOUT` |   | `60` | artifact `aws s3 sync` subprocess 타임아웃(초) |
 
 VM에서는 `/etc/tabris/settings_local.py`에 Python 상수로 정의한다. 로컬 개발 시에도 동일하게 `settings_local`를 import할 수 있는 경로에 두면 된다.
 
 ## 인프라 선행 조건 (운영 배포 시 필수)
-
-### Web Artifact 호스팅
-
-web-artifacts-builder 스킬로 생성된 `bundle.html`은 Docker 종료 후 `s3://hbsmith-tabris-artifacts/{user_id}/{unix_ts}/`에 업로드되고, CloudFront(`tabris-artifacts.hbsmith.io`)를 통해 Slack 스레드에 공개 URL로 공유된다. 인프라(S3 버킷, CloudFront 배포, Route 53 레코드)는 별도로 구축한다.
-
-**배포 시 sandbox 이미지 재빌드 필수**: `CLAUDE.md`, `web-artifacts-builder` 스킬, `bundle-artifact.sh` 변경 사항이 이미지에 반영되어야 한다.
-
-```bash
-# VM에서 코드 반영 후 이미지 재빌드
-vagrant ssh -c 'cd /opt/tabris && sudo git pull && sudo docker build -t hbsmith-claude-sandbox /opt/tabris && sudo systemctl restart tabris'
-```
-
-tabris EC2 instance profile에 아래 IAM 정책을 추가한다.
-
-```json
-{
-  "Effect": "Allow",
-  "Action": ["s3:ListBucket"],
-  "Resource": "arn:aws:s3:::hbsmith-tabris-artifacts"
-},
-{
-  "Effect": "Allow",
-  "Action": ["s3:PutObject"],
-  "Resource": "arn:aws:s3:::hbsmith-tabris-artifacts/*"
-}
-```
 
 `MEMORY_S3_SYNC_ENABLED = True`로 운영하려면 아래가 갖춰져 있어야 한다.
 
@@ -222,3 +192,17 @@ tabris EC2 instance profile에 아래 IAM 정책을 추가한다.
    ```
    업로드 sync(`sync_memory_to_s3`)는 로컬 memory를 정본으로 S3 prefix를 미러링하며, 로컬에 없는 객체는 `aws s3 sync --delete`로 제거한다. 로컬 memory가 비어 있으면 업로드는 건너뛴다(S3 백업 보호).
 3. `hbsmith-tabris-documents` 버킷 및 `aws_inspect` Fast Path와 **분리 유지** — 에이전트가 memory 버킷에 접근하지 않도록 한다.
+
+### 웹 아티팩트 호스팅 (구축 완료)
+
+`web-artifacts-builder` 스킬로 생성한 `bundle.html`을 공개 URL로 공유하는 인프라가 구축되어 있다.
+
+- **S3 버킷** `hbsmith-tabris-artifacts` (리전 `ap-northeast-2`) — 에이전트가 `upload-artifact.sh`로 직접 업로드.
+- **CloudFront + Route 53** `tabris-artifacts.hbsmith.io` — S3 앞단 웹 호스팅 엔드포인트.
+- **tabris EC2 instance profile** IAM policy: `s3:PutObject` on `arn:aws:s3:::hbsmith-tabris-artifacts/*`.
+
+배포 시 sandbox 이미지를 **반드시 재빌드**해야 `upload-artifact.sh`·`SKILL.md`·`CLAUDE.md` 변경이 컨테이너에 반영된다:
+
+```bash
+vagrant ssh -c 'sudo docker build -t hbsmith-claude-sandbox /opt/tabris'
+```

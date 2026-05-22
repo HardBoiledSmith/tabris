@@ -13,7 +13,3 @@ JIRA_API_USERNAME = '...'
 MEMORY_S3_BUCKET = 'hbsmith-tabris-memory'
 MEMORY_S3_SYNC_ENABLED = True
 MEMORY_S3_SYNC_TIMEOUT = 60
-ARTIFACT_S3_BUCKET = 'hbsmith-tabris-artifacts'
-ARTIFACT_BASE_URL = 'https://tabris-artifacts.hbsmith.io'
-ARTIFACT_S3_SYNC_ENABLED = True
-ARTIFACT_S3_SYNC_TIMEOUT = 60

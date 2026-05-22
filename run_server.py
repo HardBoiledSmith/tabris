@@ -24,10 +24,6 @@ from const import TEAM_ACCESS_DENIED_TEXT
 sys.path.append('/etc/tabris')
 from settings_local import ALLOWED_TEAM_ID
 from settings_local import ANTHROPIC_API_KEY
-from settings_local import ARTIFACT_BASE_URL
-from settings_local import ARTIFACT_S3_BUCKET
-from settings_local import ARTIFACT_S3_SYNC_ENABLED
-from settings_local import ARTIFACT_S3_SYNC_TIMEOUT
 from settings_local import BOT_USER_ID
 from settings_local import CLAUDE_TIMEOUT
 from settings_local import DOCKER_IMAGE
@@ -55,11 +51,6 @@ ARTIFACT_MAX_TOTAL_BYTES = 5_368_709_120  # 5 GiB
 WORKSPACE_OUTPUT_SUBDIR = 'output'
 # 트리거 메시지의 Slack 첨부만 호스트가 받아 컨테이너 `/workspace/input/`에 둔다.
 WORKSPACE_INPUT_SUBDIR = 'input'
-# web-artifacts-builder 번들(bundle.html)을 S3로 올릴 workspace 하위 디렉터리.
-WORKSPACE_WEB_ARTIFACT_SUBDIR = 'artifact'
-WEB_ARTIFACT_BUNDLE_NAME = 'bundle.html'
-# Slack user/bot ID는 U 또는 W로 시작하는 대문자+숫자열.
-_SLACK_USER_ID_RE = re.compile(r'^[UW][A-Z0-9]+$')
 # DM에서 파일 공유만 있는 메시지 subtype. 그 외 subtype은 무시한다.
 SLACK_DM_ALLOWED_FILE_MESSAGE_SUBTYPES = frozenset({'file_share'})
 
@@ -505,7 +496,7 @@ def _memory_dir_has_files(memory_dir: str) -> bool:
     return False
 
 
-def _aws_s3_sync(src: str, dst: str, creds: dict, *, delete: bool = False, timeout: int | None = None) -> None:
+def _aws_s3_sync(src: str, dst: str, creds: dict, *, delete: bool = False) -> None:
     """aws s3 sync로 src → dst를 동기화한다. delete=True이면 dst에서 src에 없는 객체를 제거한다."""
     env = os.environ.copy()
     env['AWS_ACCESS_KEY_ID'] = creds['AWS_ACCESS_KEY_ID']
@@ -515,8 +506,7 @@ def _aws_s3_sync(src: str, dst: str, creds: dict, *, delete: bool = False, timeo
     cmd = [_aws_cli_executable(), 's3', 'sync', src, dst, '--only-show-errors']
     if delete:
         cmd.append('--delete')
-    effective_timeout = timeout if timeout is not None else MEMORY_S3_SYNC_TIMEOUT
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=effective_timeout, check=False)
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=MEMORY_S3_SYNC_TIMEOUT, check=False)
     if result.returncode != 0:
         logger.error('aws s3 sync failed: src=%s dst=%s stderr=%s', src, dst, result.stderr[:500])
         raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
@@ -543,29 +533,6 @@ def sync_memory_to_s3(user_id: str, memory_dir: str, creds: dict) -> None:
     _aws_s3_sync(memory_dir, s3_uri, creds, delete=True)
 
 
-def upload_web_artifacts_to_s3(slack_user_id: str, run_id: str, artifact_dir: str, creds: dict) -> str | None:
-    """web-artifacts-builder 산출물을 S3에 올리고 bundle.html 공개 URL을 반환한다.
-
-    ARTIFACT_S3_SYNC_ENABLED=False, user_id 형식 불일치, 빈 디렉터리이면 None. 업로드 후
-    bundle.html이 없으면 로그만 남기고 None 반환(파일은 올라감).
-    """
-    if not ARTIFACT_S3_SYNC_ENABLED:
-        return None
-    if not _SLACK_USER_ID_RE.match(slack_user_id or ''):
-        logger.warning('upload_web_artifacts_to_s3: invalid slack_user_id %r, skipping', slack_user_id)
-        return None
-    if not _memory_dir_has_files(artifact_dir):
-        return None
-    s3_uri = f's3://{ARTIFACT_S3_BUCKET}/{slack_user_id}/{run_id}/'
-    logger.info('Uploading web artifacts to S3: %s -> %s', artifact_dir, s3_uri)
-    _aws_s3_sync(artifact_dir, s3_uri, creds, delete=False, timeout=ARTIFACT_S3_SYNC_TIMEOUT)
-    bundle_path = os.path.join(artifact_dir, WEB_ARTIFACT_BUNDLE_NAME)
-    if not os.path.isfile(bundle_path):
-        logger.info('upload_web_artifacts_to_s3: no bundle.html found, URL not generated')
-        return None
-    return f'{ARTIFACT_BASE_URL}/{slack_user_id}/{run_id}/{WEB_ARTIFACT_BUNDLE_NAME}'
-
-
 def run_claude(event: dict, context: str, request: str, progress_callback=None) -> str:
     thread_ts = event.get('thread_ts') or event.get('ts')
     msg_id = event.get('client_msg_id') or event.get('ts')
@@ -579,15 +546,13 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
     os.makedirs(run_workspace, exist_ok=True)
     output_dir = os.path.join(run_workspace, WORKSPACE_OUTPUT_SUBDIR)
     input_dir = os.path.join(run_workspace, WORKSPACE_INPUT_SUBDIR)
-    artifact_dir = os.path.join(run_workspace, WORKSPACE_WEB_ARTIFACT_SUBDIR)
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(input_dir, exist_ok=True)
-    os.makedirs(artifact_dir, exist_ok=True)
 
     memory_dir = f'{SANDBOX_USERS_DIR}/{slack_user_id}/{WORKSPACE_MEMORY_SUBDIR}'
     os.makedirs(memory_dir, exist_ok=True)
 
-    for path in (run_workspace, output_dir, input_dir, artifact_dir, memory_dir):
+    for path in (run_workspace, output_dir, input_dir, memory_dir):
         try:
             os.chown(path, CLAUDE_CONTAINER_UID, CLAUDE_CONTAINER_GID)
         except OSError:
@@ -694,6 +659,8 @@ def _run_claude_docker(
         f'SENTRY_AUTH_TOKEN={SENTRY_AUTH_TOKEN}',
         '-e',
         f'NERV_MCP_TOKEN={NERV_MCP_TOKEN}',
+        '-e',
+        f'SLACK_USER_ID={event.get("user", "")}',
         '--workdir',
         '/workspace',
         DOCKER_IMAGE,
@@ -867,29 +834,6 @@ def handle_request(event: dict, client):
             except Exception:
                 logger.warning('chat_update failed, falling back to new message', exc_info=True)
                 client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
-
-        artifact_dir = os.path.join(run_workspace, WORKSPACE_WEB_ARTIFACT_SUBDIR)
-        run_id = str(int(time.time()))
-        try:
-            artifact_creds = fetch_ec2_instance_role_credentials()
-            artifact_url = upload_web_artifacts_to_s3(
-                event.get('user'), run_id, artifact_dir, artifact_creds
-            )
-            if artifact_url:
-                client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    text=f'웹 아티팩트: {artifact_url}',
-                )
-        except (OSError, urllib.error.HTTPError, urllib.error.URLError, RuntimeError, KeyError,
-                subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            logger.exception('Failed to upload web artifact to S3')
-            try:
-                client.chat_postMessage(
-                    channel=channel, thread_ts=thread_ts, text=f'⚠️ 웹 아티팩트 업로드에 실패했습니다: {exc}'
-                )
-            except Exception:
-                logger.warning('Failed to post artifact upload error to Slack', exc_info=True)
 
         post_workspace_artifacts_to_thread(client, channel, thread_ts, run_workspace)
     except Exception:
