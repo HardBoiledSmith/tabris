@@ -13,6 +13,13 @@
       "headers": {
         "Authorization": "Basic ${ATLASSIAN_ROVO_MCP_TOKEN}"
       }
+    },
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_PAT}"
+      }
     }
   }
 }
