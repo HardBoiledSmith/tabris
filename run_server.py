@@ -27,6 +27,7 @@ from settings_local import ANTHROPIC_API_KEY
 from settings_local import BOT_USER_ID
 from settings_local import CLAUDE_TIMEOUT
 from settings_local import DOCKER_IMAGE
+from settings_local import GITHUB_PAT
 from settings_local import JIRA_API_KEY
 from settings_local import JIRA_API_USERNAME
 from settings_local import MAX_WORKERS
@@ -37,7 +38,6 @@ from settings_local import NERV_MCP_TOKEN
 from settings_local import SENTRY_AUTH_TOKEN
 from settings_local import SLACK_APP_TOKEN
 from settings_local import SLACK_BOT_TOKEN
-from settings_local import GITHUB_PAT
 
 # Atlassian MCP Basic auth: echo -n "user:api_key" | base64
 ATLASSIAN_ROVO_MCP_TOKEN = base64.b64encode(f'{JIRA_API_USERNAME}:{JIRA_API_KEY}'.encode()).decode('ascii')

@@ -16,6 +16,7 @@ def _install_settings_local_stub() -> None:
     m.BOT_USER_ID = 'UBOT'
     m.CLAUDE_TIMEOUT = 30
     m.DOCKER_IMAGE = 'test-image'
+    m.GITHUB_PAT = 'ghp-test'
     m.JIRA_API_KEY = 'jira-key'
     m.JIRA_API_USERNAME = 'jira-user'
     m.MAX_WORKERS = 2
