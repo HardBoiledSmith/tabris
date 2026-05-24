@@ -37,6 +37,7 @@ from settings_local import NERV_MCP_TOKEN
 from settings_local import SENTRY_AUTH_TOKEN
 from settings_local import SLACK_APP_TOKEN
 from settings_local import SLACK_BOT_TOKEN
+from settings_local import GITHUB_PAT
 
 # Atlassian MCP Basic auth: echo -n "user:api_key" | base64
 ATLASSIAN_ROVO_MCP_TOKEN = base64.b64encode(f'{JIRA_API_USERNAME}:{JIRA_API_KEY}'.encode()).decode('ascii')
@@ -659,6 +660,8 @@ def _run_claude_docker(
         f'SENTRY_AUTH_TOKEN={SENTRY_AUTH_TOKEN}',
         '-e',
         f'NERV_MCP_TOKEN={NERV_MCP_TOKEN}',
+        '-e',
+        f'GITHUB_PAT={GITHUB_PAT}',
         '-e',
         f'SLACK_USER_ID={event.get("user", "")}',
         '--workdir',
