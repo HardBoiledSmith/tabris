@@ -441,6 +441,33 @@ def _progress_waiting_text(elapsed_sec: int, timeout_sec: int) -> str:
     return f'⏳ 처리 중… {elapsed_sec}s/{timeout_sec}s'
 
 
+def _docker_container_name(thread_ts: str) -> str:
+    """thread_ts로부터 Docker --name에 쓸 고유 컨테이너 이름을 만든다."""
+    return f'claude-{thread_ts}'.replace('.', '-')
+
+
+def _build_cancel_blocks(text: str, container_name: str) -> list[dict]:
+    """대기/진행 메시지에 취소 버튼을 포함한 Block Kit blocks를 만든다."""
+    return [
+        {
+            'type': 'section',
+            'text': {'type': 'mrkdwn', 'text': text},
+        },
+        {
+            'type': 'actions',
+            'elements': [
+                {
+                    'type': 'button',
+                    'text': {'type': 'plain_text', 'text': '❌ 취소'},
+                    'style': 'danger',
+                    'action_id': 'cancel_claude_run',
+                    'value': container_name,
+                }
+            ],
+        },
+    ]
+
+
 def fetch_ec2_instance_role_credentials() -> dict[str, str]:
     """EC2 IMDSv2로 인스턴스 프로파일(IAM role)의 임시 AWS 자격증명을 조회한다."""
 
@@ -538,9 +565,9 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
     thread_ts = event.get('thread_ts') or event.get('ts')
     msg_id = event.get('client_msg_id') or event.get('ts')
     is_dm = event.get('channel_type') == 'im'
-    slack_user_id = event.get('user')
+    slack_user_id = event.get('user') or event.get('bot_id')
     if not slack_user_id:
-        logger.error('run_claude: event missing user ID')
+        logger.error('run_claude: event missing user ID and bot_id')
         return '⚠️ Slack user ID 없음: 요청을 처리할 수 없습니다.'
 
     run_workspace = f'{SANDBOX_RUNS_DIR}/{thread_ts}'
@@ -626,10 +653,13 @@ def _run_claude_docker(
     is_dm: bool,
 ) -> tuple[int, str]:
     """Docker 컨테이너에서 Claude를 실행하고 (returncode, output_text)를 반환한다."""
+    container_name = _docker_container_name(thread_ts)
     cmd = [
         '/usr/bin/docker',
         'run',
         '--rm',
+        '--name',
+        container_name,
         '--memory',
         '512m',
         '--cpus',
@@ -741,6 +771,10 @@ def _run_claude_docker(
     stdout = ''.join(stdout_chunks)
     stderr = ''.join(stderr_chunks)
 
+    if process.returncode in (137, 143):
+        logger.info('Claude container cancelled by user (returncode=%d)', process.returncode)
+        return process.returncode, '🛑 사용자에 의해 취소되었습니다.'
+
     if process.returncode != 0:
         logger.error('Claude exited with code %d: %s', process.returncode, stderr)
         return process.returncode, f'⚠️ 실행 오류:\n```{stderr[:300]}```'
@@ -801,7 +835,14 @@ def handle_request(event: dict, client):
             logger.exception('Failed to post team access denied message')
         return
 
-    waiting_msg = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text='⏳ 처리 중...')
+    container_name = _docker_container_name(thread_ts)
+    initial_text = '⏳ 처리 중...'
+    waiting_msg = client.chat_postMessage(
+        channel=channel,
+        thread_ts=thread_ts,
+        text=initial_text,
+        blocks=_build_cancel_blocks(initial_text, container_name),
+    )
 
     try:
         replies = client.conversations_replies(channel=channel, ts=thread_ts)
@@ -814,7 +855,12 @@ def handle_request(event: dict, client):
 
     def _progress_callback(progress_text: str) -> None:
         try:
-            client.chat_update(channel=channel, ts=waiting_msg['ts'], text=progress_text)
+            client.chat_update(
+                channel=channel,
+                ts=waiting_msg['ts'],
+                text=progress_text,
+                blocks=_build_cancel_blocks(progress_text, container_name),
+            )
         except Exception:
             logger.warning('Failed to post progress update', exc_info=True)
 
@@ -843,6 +889,58 @@ def handle_request(event: dict, client):
         logger.exception('Failed to process request', exc_info=True)
     finally:
         shutil.rmtree(run_workspace, ignore_errors=True)
+
+
+@app.action('cancel_claude_run')
+def on_cancel_claude_run(ack, body, client):
+    """취소 버튼 클릭 → Docker 컨테이너를 중지한다. ALLOWED_TEAM_ID 검사를 포함한다."""
+    ack()
+
+    action_team_id = (body.get('team') or {}).get('id')
+    if not is_allowed_slack_team({'team_id': action_team_id}):
+        user_id = (body.get('user') or {}).get('id')
+        logger.warning(
+            'cancel_claude_run denied: team_id=%s user=%s',
+            action_team_id,
+            user_id,
+        )
+        try:
+            channel = body['channel']['id']
+            message_ts = body['message']['ts']
+            thread_ts = body['message'].get('thread_ts') or message_ts
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=TEAM_ACCESS_DENIED_TEXT,
+            )
+        except Exception:
+            logger.exception('Failed to post team access denied message for cancel action')
+        return
+
+    container_name = body['actions'][0]['value']
+    user_id = body['user']['id']
+    channel = body['channel']['id']
+    message_ts = body['message']['ts']
+
+    try:
+        result = subprocess.run(
+            ['/usr/bin/docker', 'stop', '-t', '5', container_name],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode == 0:
+            cancel_text = f'🛑 <@{user_id}>님이 작업을 취소했습니다.'
+        else:
+            cancel_text = '⚠️ 취소 실패: 이미 종료되었거나 컨테이너를 찾을 수 없습니다.'
+    except Exception as exc:
+        logger.exception('docker stop failed for %s', container_name)
+        cancel_text = f'⚠️ 취소 중 오류: {exc}'
+
+    try:
+        client.chat_update(channel=channel, ts=message_ts, text=cancel_text, blocks=[])
+    except Exception:
+        logger.warning('Failed to update message after cancel', exc_info=True)
 
 
 def _submit(event, client, context=None):
