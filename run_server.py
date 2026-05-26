@@ -151,7 +151,7 @@ def is_allowed_slack_team(event: dict) -> bool:
     if not tid:
         logger.warning(
             'Slack event without team_id; denying. user=%s event_keys=%s',
-            event.get('user'),
+            event.get('user') or event.get('bot_id'),
             list(event.keys()),
         )
         return False
@@ -436,9 +436,15 @@ def download_slack_message_files_to_input(event: dict, workspace: str, bot_token
     return saved
 
 
+def _format_duration(seconds: int) -> str:
+    """초를 'N분 NN초' 형태로 변환한다."""
+    m, s = divmod(seconds, 60)
+    return f'{m}분 {s:02d}초'
+
+
 def _progress_waiting_text(elapsed_sec: int, timeout_sec: int) -> str:
-    """Claude 실행 중 Slack 대기 메시지: 경과/최대 대기(초)."""
-    return f'⏳ 처리 중… {elapsed_sec}s/{timeout_sec}s'
+    """Claude 실행 중 Slack 대기 메시지: 경과/최대 대기(분초)."""
+    return f'⏳ 처리 중… ({_format_duration(elapsed_sec)} / {_format_duration(timeout_sec)})'
 
 
 def _docker_container_name(thread_ts: str) -> str:
@@ -561,14 +567,14 @@ def sync_memory_to_s3(user_id: str, memory_dir: str, creds: dict) -> None:
     _aws_s3_sync(memory_dir, s3_uri, creds, delete=True)
 
 
-def run_claude(event: dict, context: str, request: str, progress_callback=None) -> str:
+def run_claude(event: dict, context: str, request: str, progress_callback=None) -> tuple[bool, str]:
     thread_ts = event.get('thread_ts') or event.get('ts')
     msg_id = event.get('client_msg_id') or event.get('ts')
     is_dm = event.get('channel_type') == 'im'
     slack_user_id = event.get('user') or event.get('bot_id')
     if not slack_user_id:
         logger.error('run_claude: event missing user ID and bot_id')
-        return '⚠️ Slack user ID 없음: 요청을 처리할 수 없습니다.'
+        return False, '⚠️ Slack user ID 없음: 요청을 처리할 수 없습니다.'
 
     run_workspace = f'{SANDBOX_RUNS_DIR}/{thread_ts}'
     os.makedirs(run_workspace, exist_ok=True)
@@ -614,14 +620,14 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
             aws_creds = fetch_ec2_instance_role_credentials()
         except (OSError, urllib.error.HTTPError, urllib.error.URLError, RuntimeError, KeyError) as exc:
             logger.exception('Failed to fetch EC2 instance role credentials from IMDS')
-            return f'⚠️ AWS 자격증명 조회 실패(IMDS): {exc}'
+            return False, f'⚠️ AWS 자격증명 조회 실패(IMDS): {exc}'
 
         with _user_memory_lock(slack_user_id):
             try:
                 sync_memory_from_s3(slack_user_id, memory_dir, aws_creds)
             except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired) as exc:
                 logger.exception('Failed to restore memory from S3 for user %s', slack_user_id)
-                return f'⚠️ memory 복원(S3) 실패: {exc}'
+                return False, f'⚠️ memory 복원(S3) 실패: {exc}'
 
             returncode, text_out = _run_claude_docker(
                 run_workspace, memory_dir, aws_creds, prompt, progress_callback, thread_ts, event, msg_id, is_dm
@@ -634,11 +640,11 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
                     logger.exception('Failed to backup memory to S3 for user %s', slack_user_id)
                     # Claude 응답은 그대로 반환하고 경고만 로깅한다.
 
-        return text_out
+        return returncode == 0, text_out
 
     except Exception as e:
         logger.exception('Unexpected error in run_claude')
-        return f'⚠️ 오류: {e}'
+        return False, f'⚠️ 오류: {e}'
 
 
 def _run_claude_docker(
@@ -790,7 +796,7 @@ def _run_claude_docker(
         _normalize_slack_team_id(event.get('team_id') or event.get('team')),
         event.get('channel'),
         thread_ts,
-        event.get('user'),
+        event.get('user') or event.get('bot_id'),
         msg_id,
         output_length,
     )
@@ -823,7 +829,7 @@ def handle_request(event: dict, client):
         _normalize_slack_team_id(event.get('team_id') or event.get('team')),
         channel,
         thread_ts,
-        event.get('user'),
+        event.get('user') or event.get('bot_id'),
         msg_id,
         user_request,
     )
@@ -866,7 +872,23 @@ def handle_request(event: dict, client):
 
     run_workspace = f'{SANDBOX_RUNS_DIR}/{thread_ts}'
     try:
-        answer = run_claude(event, context, user_request, progress_callback=_progress_callback)
+        run_start = time.time()
+        success, answer = run_claude(event, context, user_request, progress_callback=_progress_callback)
+        run_elapsed = int(time.time() - run_start)
+        elapsed_display = _format_duration(run_elapsed)
+
+        logger.info(
+            '[COMPLETED] type=%s channel=%s thread_ts=%s user=%s success=%s elapsed=%s',
+            msg_type,
+            channel,
+            thread_ts,
+            event.get('user'),
+            success,
+            elapsed_display,
+        )
+
+        if success:
+            answer = f'{answer}\n\n> ⏱️ 실행 시간: {elapsed_display}'
 
         try:
             post_claude_markdown_to_thread(

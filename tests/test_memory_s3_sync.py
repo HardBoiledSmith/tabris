@@ -165,8 +165,9 @@ def test_run_claude_returns_error_when_user_missing(monkeypatch):
     monkeypatch.setattr(run_server.subprocess, 'Popen', popen_mock)
 
     event = {'channel_type': 'im', 'ts': '1.1', 'thread_ts': '1.1'}
-    result = run_server.run_claude(event, '', 'hello')
+    success, result = run_server.run_claude(event, '', 'hello')
 
+    assert success is False
     assert '⚠️' in result
     popen_mock.assert_not_called()
 
@@ -183,7 +184,8 @@ def test_run_claude_s3_download_failure_blocks_docker(monkeypatch, tmp_path):
     monkeypatch.setattr(run_server.subprocess, 'Popen', popen_mock)
 
     event = {'channel_type': 'im', 'ts': '1.1', 'thread_ts': '1.1', 'user': 'UTEST'}
-    result = run_server.run_claude(event, '', 'hello')
+    success, result = run_server.run_claude(event, '', 'hello')
 
+    assert success is False
     assert '⚠️' in result
     popen_mock.assert_not_called()
