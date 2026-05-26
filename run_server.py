@@ -16,7 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-from slack_markdown_parser import convert_markdown_to_slack_payloads
+from slack_markdown_parser import build_fallback_text_from_blocks
+from slack_markdown_parser import convert_markdown_to_slack_blocks
 from slack_sdk.errors import SlackApiError
 
 from const import TEAM_ACCESS_DENIED_TEXT
@@ -158,6 +159,9 @@ def is_allowed_slack_team(event: dict) -> bool:
     return tid == ALLOWED_TEAM_ID
 
 
+SLACK_MAX_BLOCKS_PER_MESSAGE = 50
+
+
 def post_claude_markdown_to_thread(
     client,
     channel: str,
@@ -165,50 +169,44 @@ def post_claude_markdown_to_thread(
     markdown_text: str,
     update_ts: str,
 ) -> None:
-    """Claude Code 마크다운을 Block Kit(markdown/table)으로 변환해 게시한다.
+    """Claude Code 마크다운을 Block Kit(markdown/table)으로 변환해 단일 메시지로 게시한다.
 
-    테이블이 여러 개면 라이브러리가 메시지를 나누므로, 첫 덩어리는 대기 메시지를
-    갱신하고 나머지는 같은 스레드에 연속 게시한다.
+    50블록 초과 시에만 메시지를 나눈다. 첫 덩어리는 대기 메시지를 갱신하고
+    나머지는 같은 스레드에 연속 게시한다.
     """
 
-    def _payload_kwargs(payload: dict) -> dict:
-        kwargs: dict = {'text': payload['text']}
-        blocks = payload.get('blocks') or []
-        if blocks:
-            kwargs['blocks'] = blocks
-        return kwargs
-
     text = markdown_text if markdown_text is not None else ''
-    payloads = list(
-        convert_markdown_to_slack_payloads(
-            text,
-            preserve_visual_blank_lines=True,
-        )
-    )
-    if not payloads:
-        payloads = [{'text': text.strip() or ' ', 'blocks': []}]
+    all_blocks = convert_markdown_to_slack_blocks(text, preserve_visual_blank_lines=True)
 
-    first = payloads[0]
-    try:
-        client.chat_update(
-            channel=channel,
-            ts=update_ts,
-            **_payload_kwargs(first),
+    if not all_blocks:
+        all_blocks = []
+
+    messages: list[dict] = []
+    for i in range(0, max(len(all_blocks), 1), SLACK_MAX_BLOCKS_PER_MESSAGE):
+        chunk = all_blocks[i : i + SLACK_MAX_BLOCKS_PER_MESSAGE]
+        fallback = build_fallback_text_from_blocks(chunk).strip() if chunk else ''
+        messages.append(
+            {
+                'text': fallback or text.strip() or ' ',
+                'blocks': chunk,
+            }
         )
+
+    first = messages[0]
+    kwargs: dict = {'text': first['text']}
+    if first['blocks']:
+        kwargs['blocks'] = first['blocks']
+    try:
+        client.chat_update(channel=channel, ts=update_ts, **kwargs)
     except Exception:
         logger.warning('chat_update failed, falling back to new message', exc_info=True)
-        client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            **_payload_kwargs(first),
-        )
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, **kwargs)
 
-    for extra in payloads[1:]:
-        client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            **_payload_kwargs(extra),
-        )
+    for extra in messages[1:]:
+        extra_kwargs: dict = {'text': extra['text']}
+        if extra['blocks']:
+            extra_kwargs['blocks'] = extra['blocks']
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, **extra_kwargs)
 
 
 def _collect_workspace_files_for_upload(workspace: str) -> list[tuple[str, bytes]]:
@@ -891,9 +889,6 @@ def handle_request(event: dict, client):
             elapsed_display,
         )
 
-        if success:
-            answer = f'{answer}\n\n> ⏱️ 실행 시간: {elapsed_display}'
-
         try:
             post_claude_markdown_to_thread(
                 client,
@@ -909,6 +904,24 @@ def handle_request(event: dict, client):
             except Exception:
                 logger.warning('chat_update failed, falling back to new message', exc_info=True)
                 client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
+
+        if success:
+            try:
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=f'⏱️ 실행 시간: {elapsed_display}',
+                    blocks=[
+                        {
+                            'type': 'context',
+                            'elements': [
+                                {'type': 'mrkdwn', 'text': f'⏱️ 실행 시간: {elapsed_display}'},
+                            ],
+                        }
+                    ],
+                )
+            except Exception:
+                logger.warning('Failed to post elapsed time context', exc_info=True)
 
         post_workspace_artifacts_to_thread(client, channel, thread_ts, run_workspace)
     except Exception:
