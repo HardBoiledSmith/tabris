@@ -168,11 +168,13 @@ def post_claude_markdown_to_thread(
     thread_ts: str,
     markdown_text: str,
     update_ts: str,
+    suffix_blocks: list[dict] | None = None,
 ) -> None:
     """Claude Code 마크다운을 Block Kit(markdown/table)으로 변환해 단일 메시지로 게시한다.
 
     50블록 초과 시에만 메시지를 나눈다. 첫 덩어리는 대기 메시지를 갱신하고
     나머지는 같은 스레드에 연속 게시한다.
+    suffix_blocks가 주어지면 마지막 메시지의 블록 끝에 추가한다.
     """
 
     text = markdown_text if markdown_text is not None else ''
@@ -180,6 +182,9 @@ def post_claude_markdown_to_thread(
 
     if not all_blocks:
         all_blocks = []
+
+    if suffix_blocks:
+        all_blocks.extend(suffix_blocks)
 
     messages: list[dict] = []
     for i in range(0, max(len(all_blocks), 1), SLACK_MAX_BLOCKS_PER_MESSAGE):
@@ -889,6 +894,17 @@ def handle_request(event: dict, client):
             elapsed_display,
         )
 
+        elapsed_suffix = None
+        if success:
+            elapsed_suffix = [
+                {
+                    'type': 'context',
+                    'elements': [
+                        {'type': 'mrkdwn', 'text': f'⏱️ 실행 시간: {elapsed_display}'},
+                    ],
+                }
+            ]
+
         try:
             post_claude_markdown_to_thread(
                 client,
@@ -896,6 +912,7 @@ def handle_request(event: dict, client):
                 thread_ts=thread_ts,
                 markdown_text=answer,
                 update_ts=waiting_msg['ts'],
+                suffix_blocks=elapsed_suffix,
             )
         except Exception:
             logger.exception('Block Kit post failed, falling back to plain text')
@@ -904,24 +921,6 @@ def handle_request(event: dict, client):
             except Exception:
                 logger.warning('chat_update failed, falling back to new message', exc_info=True)
                 client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
-
-        if success:
-            try:
-                client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    text=f'⏱️ 실행 시간: {elapsed_display}',
-                    blocks=[
-                        {
-                            'type': 'context',
-                            'elements': [
-                                {'type': 'mrkdwn', 'text': f'⏱️ 실행 시간: {elapsed_display}'},
-                            ],
-                        }
-                    ],
-                )
-            except Exception:
-                logger.warning('Failed to post elapsed time context', exc_info=True)
 
         post_workspace_artifacts_to_thread(client, channel, thread_ts, run_workspace)
     except Exception:
