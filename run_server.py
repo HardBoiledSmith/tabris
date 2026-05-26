@@ -437,9 +437,13 @@ def download_slack_message_files_to_input(event: dict, workspace: str, bot_token
 
 
 def _format_duration(seconds: int) -> str:
-    """초를 'N분 NN초' 형태로 변환한다."""
+    """초를 읽기 쉬운 한국어 시간 표현으로 변환한다. 0인 단위는 생략한다."""
     m, s = divmod(seconds, 60)
-    return f'{m}분 {s:02d}초'
+    if m and s:
+        return f'{m}분 {s}초'
+    if m:
+        return f'{m}분'
+    return f'{s}초'
 
 
 def _progress_waiting_text(elapsed_sec: int, timeout_sec: int) -> str:

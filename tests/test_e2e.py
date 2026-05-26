@@ -44,7 +44,11 @@ def test_dm_happy_path_posts_claude_result(run_server_module, slack_client, fake
 
     run_server_module.on_dm(_dm_event('hello bot'), slack_client)
 
-    slack_client.chat_postMessage.assert_any_call(channel='D123', thread_ts='1700000000.000001', text='⏳ 처리 중...')
+    post_calls = slack_client.chat_postMessage.call_args_list
+    waiting_call = [c for c in post_calls if c.kwargs.get('text') == '⏳ 처리 중...']
+    assert waiting_call, '대기 메시지가 게시되어야 한다'
+    assert waiting_call[0].kwargs['channel'] == 'D123'
+    assert waiting_call[0].kwargs['thread_ts'] == '1700000000.000001'
     assert slack_client.chat_update.called, 'Claude 응답이 대기 메시지를 갱신해야 한다'
     update_kwargs = slack_client.chat_update.call_args.kwargs
     assert update_kwargs['channel'] == 'D123'
@@ -58,7 +62,11 @@ def test_mention_happy_path_posts_claude_result(run_server_module, slack_client,
 
     run_server_module.on_mention(_mention_event('<@UBOT> ping'), slack_client)
 
-    slack_client.chat_postMessage.assert_any_call(channel='C123', thread_ts='1700000000.000002', text='⏳ 처리 중...')
+    post_calls = slack_client.chat_postMessage.call_args_list
+    waiting_call = [c for c in post_calls if c.kwargs.get('text') == '⏳ 처리 중...']
+    assert waiting_call, '대기 메시지가 게시되어야 한다'
+    assert waiting_call[0].kwargs['channel'] == 'C123'
+    assert waiting_call[0].kwargs['thread_ts'] == '1700000000.000002'
     assert slack_client.chat_update.called
     assert 'mention answer' in slack_client.chat_update.call_args.kwargs['text']
 
