@@ -673,7 +673,7 @@ def _run_claude_docker(
         '--name',
         container_name,
         '--memory',
-        '512m',
+        '1g',
         '--cpus',
         '1.0',
         '--cap-drop',
