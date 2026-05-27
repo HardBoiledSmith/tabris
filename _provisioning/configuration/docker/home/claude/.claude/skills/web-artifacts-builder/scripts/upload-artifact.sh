@@ -3,8 +3,8 @@
 # Usage: bash scripts/upload-artifact.sh [bundle.html path]
 set -e
 
-BUCKET="hbsmith-tabris-artifacts"
-BASE_URL="https://tabris-artifacts.hbsmith.io"
+BUCKET="$ARTIFACTS_S3_BUCKET"
+BASE_URL="$ARTIFACTS_BASE_URL"
 BUNDLE_FILE="${1:-bundle.html}"
 RUN_ID="$(date +%s)"
 USER_ID="${SLACK_USER_ID:-anonymous}"

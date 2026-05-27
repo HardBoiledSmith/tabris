@@ -27,6 +27,8 @@ def _install_settings_local_stub() -> None:
     m.MEMORY_S3_BUCKET = 'hbsmith-tabris-memory'
     m.MEMORY_S3_SYNC_ENABLED = False
     m.MEMORY_S3_SYNC_TIMEOUT = 60
+    m.ARTIFACTS_S3_BUCKET = 'hbsmith-tabris-artifacts'
+    m.ARTIFACTS_BASE_URL = 'https://tabris-artifacts.hbsmith.io'
     sys.modules['settings_local'] = m
 
 

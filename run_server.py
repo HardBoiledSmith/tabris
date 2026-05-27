@@ -25,6 +25,8 @@ from const import TEAM_ACCESS_DENIED_TEXT
 sys.path.append('/etc/tabris')
 from settings_local import ALLOWED_TEAM_ID
 from settings_local import ANTHROPIC_API_KEY
+from settings_local import ARTIFACTS_BASE_URL
+from settings_local import ARTIFACTS_S3_BUCKET
 from settings_local import BOT_USER_ID
 from settings_local import CLAUDE_TIMEOUT
 from settings_local import DOCKER_IMAGE
@@ -706,6 +708,10 @@ def _run_claude_docker(
         f'GITHUB_PAT={GITHUB_PAT}',
         '-e',
         f'SLACK_USER_ID={event.get("user", "")}',
+        '-e',
+        f'ARTIFACTS_S3_BUCKET={ARTIFACTS_S3_BUCKET}',
+        '-e',
+        f'ARTIFACTS_BASE_URL={ARTIFACTS_BASE_URL}',
         '--workdir',
         '/workspace',
         DOCKER_IMAGE,

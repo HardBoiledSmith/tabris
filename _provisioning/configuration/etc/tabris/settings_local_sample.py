@@ -14,3 +14,5 @@ MEMORY_S3_BUCKET = 'hbsmith-tabris-memory'
 MEMORY_S3_SYNC_ENABLED = True
 MEMORY_S3_SYNC_TIMEOUT = 60
 GITHUB_PAT = '...'
+ARTIFACTS_S3_BUCKET = 'hbsmith-tabris-artifacts'
+ARTIFACTS_BASE_URL = 'https://tabris-artifacts.hbsmith.io'
