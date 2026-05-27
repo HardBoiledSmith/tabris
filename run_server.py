@@ -471,8 +471,7 @@ def _build_cancel_blocks(text: str, container_name: str) -> list[dict]:
             'elements': [
                 {
                     'type': 'button',
-                    'text': {'type': 'plain_text', 'text': '❌ 실행 취소'},
-                    'style': 'primary',
+                    'text': {'type': 'plain_text', 'text': '🛑 실행 취소'},
                     'action_id': 'cancel_claude_run',
                     'value': container_name,
                 }
