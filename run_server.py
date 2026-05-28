@@ -162,6 +162,136 @@ def is_allowed_slack_team(event: dict) -> bool:
 
 
 SLACK_MAX_BLOCKS_PER_MESSAGE = 50
+SLACK_MSG_REDIRECT_NOTICE = '메시지가 길어 새 글로 포스팅합니다.'
+SLACK_MSG_FILE_NOTICE = '답변이 너무 길어져 파일로 첨부합니다.'
+
+
+def _is_msg_too_long(exc: Exception) -> bool:
+    return isinstance(exc, SlackApiError) and exc.response.get('error') == 'msg_too_long'
+
+
+def _clear_waiting_for_redirect(client, channel: str, update_ts: str) -> None:
+    """대기 메시지를 안내 평문으로 갱신하고 취소 버튼 블록을 제거한다."""
+    try:
+        client.chat_update(
+            channel=channel,
+            ts=update_ts,
+            text=SLACK_MSG_REDIRECT_NOTICE,
+            blocks=[],
+        )
+    except Exception:
+        logger.warning('_clear_waiting_for_redirect failed', exc_info=True)
+
+
+def _upload_answer_as_file(
+    client, channel: str, thread_ts: str, content: str, filename: str = 'claude-response.md'
+) -> None:
+    """응답 본문을 파일로 업로드한다. 실패해도 로그만 남긴다."""
+    try:
+        client.files_upload_v2(
+            channel=channel,
+            thread_ts=thread_ts,
+            filename=filename,
+            content=content.encode('utf-8'),
+            title=filename,
+        )
+    except SlackApiError as exc:
+        err = exc.response.get('error') if exc.response else None
+        if err == 'missing_scope':
+            logger.warning(
+                'files_upload_v2 skipped: missing scope %r (add Bot scope "files:write")',
+                exc.response.get('needed'),
+            )
+        else:
+            logger.warning('files_upload_v2 failed', exc_info=True)
+    except Exception:
+        logger.warning('files_upload_v2 failed', exc_info=True)
+
+
+def _post_with_degrade(
+    client,
+    channel: str,
+    thread_ts: str,
+    *,
+    text: str,
+    blocks: list[dict],
+    source_text: str,
+) -> None:
+    """3단계 degrade ladder로 스레드에 메시지를 게시한다.
+
+    1단계: blocks + text (Block Kit)
+    2단계: text-only (원문 plain)
+    3단계: 안내 메시지 + 파일 첨부
+    msg_too_long 이외의 오류는 그대로 raise한다.
+    """
+    # 1단계: blocks + text
+    kwargs: dict = {'text': text}
+    if blocks:
+        kwargs['blocks'] = blocks
+    try:
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, **kwargs)
+        return
+    except Exception as exc:
+        if not _is_msg_too_long(exc):
+            logger.warning('chat_postMessage failed (stage 1)', exc_info=True)
+            raise
+        logger.warning(
+            'chat_postMessage msg_too_long (stage 1), falling back to text-only. text_len=%d blocks=%d source_len=%d',
+            len(text),
+            len(blocks),
+            len(source_text),
+        )
+
+    # 2단계: text-only (원문)
+    try:
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=source_text)
+        return
+    except Exception as exc:
+        if not _is_msg_too_long(exc):
+            logger.warning('chat_postMessage failed (stage 2)', exc_info=True)
+            raise
+        logger.warning(
+            'chat_postMessage msg_too_long (stage 2), falling back to file upload. source_len=%d',
+            len(source_text),
+        )
+
+    # 3단계: 파일 첨부
+    try:
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=SLACK_MSG_FILE_NOTICE)
+    except Exception:
+        logger.warning('chat_postMessage notice for file upload failed', exc_info=True)
+    _upload_answer_as_file(client, channel, thread_ts, source_text)
+
+
+def _update_waiting_with_degrade(
+    client,
+    channel: str,
+    thread_ts: str,
+    update_ts: str,
+    *,
+    text: str,
+    blocks: list[dict],
+    source_text: str,
+) -> None:
+    """대기 메시지를 갱신하고, msg_too_long 시 안내 stub 후 _post_with_degrade로 넘긴다."""
+    kwargs: dict = {'text': text}
+    if blocks:
+        kwargs['blocks'] = blocks
+    try:
+        client.chat_update(channel=channel, ts=update_ts, **kwargs)
+        return
+    except Exception as exc:
+        if _is_msg_too_long(exc):
+            logger.warning(
+                'chat_update msg_too_long, redirecting to new message. text_len=%d blocks=%d source_len=%d',
+                len(text),
+                len(blocks),
+                len(source_text),
+            )
+            _clear_waiting_for_redirect(client, channel, update_ts)
+        else:
+            logger.warning('chat_update failed, falling back to new message', exc_info=True)
+    _post_with_degrade(client, channel, thread_ts, text=text, blocks=blocks, source_text=source_text)
 
 
 def post_claude_markdown_to_thread(
@@ -177,8 +307,8 @@ def post_claude_markdown_to_thread(
     50블록 초과 시에만 메시지를 나눈다. 첫 덩어리는 대기 메시지를 갱신하고
     나머지는 같은 스레드에 연속 게시한다.
     suffix_blocks가 주어지면 마지막 메시지의 블록 끝에 추가한다.
+    msg_too_long 시 3단계 degrade(blocks → text-only → 파일)로 fallback한다.
     """
-
     text = markdown_text if markdown_text is not None else ''
     all_blocks = convert_markdown_to_slack_blocks(text, preserve_visual_blank_lines=True)
 
@@ -200,20 +330,25 @@ def post_claude_markdown_to_thread(
         )
 
     first = messages[0]
-    kwargs: dict = {'text': first['text']}
-    if first['blocks']:
-        kwargs['blocks'] = first['blocks']
-    try:
-        client.chat_update(channel=channel, ts=update_ts, **kwargs)
-    except Exception:
-        logger.warning('chat_update failed, falling back to new message', exc_info=True)
-        client.chat_postMessage(channel=channel, thread_ts=thread_ts, **kwargs)
+    _update_waiting_with_degrade(
+        client,
+        channel,
+        thread_ts,
+        update_ts,
+        text=first['text'],
+        blocks=first['blocks'],
+        source_text=text,
+    )
 
     for extra in messages[1:]:
-        extra_kwargs: dict = {'text': extra['text']}
-        if extra['blocks']:
-            extra_kwargs['blocks'] = extra['blocks']
-        client.chat_postMessage(channel=channel, thread_ts=thread_ts, **extra_kwargs)
+        _post_with_degrade(
+            client,
+            channel,
+            thread_ts,
+            text=extra['text'],
+            blocks=extra['blocks'],
+            source_text=text,
+        )
 
 
 def _collect_workspace_files_for_upload(workspace: str) -> list[tuple[str, bytes]]:
@@ -921,11 +1056,15 @@ def handle_request(event: dict, client):
             )
         except Exception:
             logger.exception('Block Kit post failed, falling back to plain text')
-            try:
-                client.chat_update(channel=channel, ts=waiting_msg['ts'], text=answer)
-            except Exception:
-                logger.warning('chat_update failed, falling back to new message', exc_info=True)
-                client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
+            _clear_waiting_for_redirect(client, channel, waiting_msg['ts'])
+            _post_with_degrade(
+                client,
+                channel,
+                thread_ts,
+                text=answer,
+                blocks=[],
+                source_text=answer,
+            )
 
         post_workspace_artifacts_to_thread(client, channel, thread_ts, run_workspace)
     except Exception:
