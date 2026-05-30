@@ -15,23 +15,23 @@ from unittest.mock import MagicMock
 from tests.helpers import install_claude_popen_mock
 
 
-def _dm_event(text: str = 'hi there', *, team_id: str = 'T_ALLOWED') -> dict:
+def _dm_event(text: str = 'hi there', *, team_id: str = 'T_ALLOWED', user: str = 'U_USER') -> dict:
     return {
         'type': 'message',
         'channel_type': 'im',
         'channel': 'D123',
-        'user': 'U_USER',
+        'user': user,
         'team_id': team_id,
         'ts': '1700000000.000001',
         'text': text,
     }
 
 
-def _mention_event(text: str = '<@UBOT> ping', *, team_id: str = 'T_ALLOWED') -> dict:
+def _mention_event(text: str = '<@UBOT> ping', *, team_id: str = 'T_ALLOWED', user: str = 'U_USER') -> dict:
     return {
         'type': 'app_mention',
         'channel': 'C123',
-        'user': 'U_USER',
+        'user': user,
         'team_id': team_id,
         'ts': '1700000000.000002',
         'text': text,
@@ -72,7 +72,7 @@ def test_mention_happy_path_posts_claude_result(run_server_module, slack_client,
 
 
 def test_disallowed_team_is_rejected_without_claude(run_server_module, slack_client, monkeypatch):
-    """ALLOWED_TEAM_ID와 다른 팀이면 거부 메시지만 보내고 Claude를 돌리지 않는다."""
+    """허용 팀과 다른 팀이면 거부 메시지만 보내고 Claude를 돌리지 않는다."""
     popen_mock = MagicMock()
     monkeypatch.setattr(run_server_module.subprocess, 'Popen', popen_mock)
 
@@ -83,6 +83,62 @@ def test_disallowed_team_is_rejected_without_claude(run_server_module, slack_cli
         channel='D123',
         thread_ts='1700000000.000001',
         text=run_server_module.TEAM_ACCESS_DENIED_TEXT,
+    )
+    slack_client.chat_update.assert_not_called()
+
+
+def test_any_allowed_team_is_accepted(run_server_module, slack_client, fake_claude_ok, monkeypatch):
+    """허용 팀 중 하나면 Claude를 실행한다."""
+    monkeypatch.setattr(run_server_module, '_ALLOWED_TEAM_IDS', frozenset({'T_ALLOWED', 'T_ALLOWED_ALT'}))
+    monkeypatch.setattr(run_server_module, '_ALL_ALLOWED_TEAMS', frozenset({'T_ALLOWED', 'T_ALLOWED_ALT'}))
+    fake_claude_ok('alt team ok')
+
+    run_server_module.on_dm(_dm_event('hello', team_id='T_ALLOWED_ALT'), slack_client)
+
+    assert slack_client.chat_update.called
+    assert 'alt team ok' in slack_client.chat_update.call_args.kwargs['text']
+
+
+def test_all_user_team_allows_any_user(run_server_module, slack_client, fake_claude_ok, monkeypatch):
+    """ALLOWED_ALL_USER_TEAM_IDS에 속한 팀이면 user 목록에 없는 사람도 허용한다."""
+    monkeypatch.setattr(run_server_module, '_ALLOWED_ALL_USER_TEAM_IDS', frozenset({'T_OPEN'}))
+    monkeypatch.setattr(run_server_module, '_ALL_ALLOWED_TEAMS', frozenset({'T_ALLOWED', 'T_OPEN'}))
+    fake_claude_ok('open team ok')
+
+    run_server_module.on_dm(_dm_event('hi', team_id='T_OPEN', user='U_RANDOM'), slack_client)
+
+    assert slack_client.chat_update.called
+    assert 'open team ok' in slack_client.chat_update.call_args.kwargs['text']
+
+
+def test_disallowed_user_is_rejected_on_mention(run_server_module, slack_client, monkeypatch):
+    """멘션 경로는 ALLOWED_USER_IDS에 없는 user면 거부한다."""
+    popen_mock = MagicMock()
+    monkeypatch.setattr(run_server_module.subprocess, 'Popen', popen_mock)
+
+    run_server_module.on_mention(_mention_event('<@UBOT> hi', user='U_OTHER'), slack_client)
+
+    popen_mock.assert_not_called()
+    slack_client.chat_postMessage.assert_called_once_with(
+        channel='C123',
+        thread_ts='1700000000.000002',
+        text=run_server_module.USER_ACCESS_DENIED_TEXT,
+    )
+    slack_client.chat_update.assert_not_called()
+
+
+def test_disallowed_user_is_rejected_on_dm(run_server_module, slack_client, monkeypatch):
+    """DM 경로도 사람(user)에는 ALLOWED_USER_IDS를 적용해 미허용 user를 거부한다."""
+    popen_mock = MagicMock()
+    monkeypatch.setattr(run_server_module.subprocess, 'Popen', popen_mock)
+
+    run_server_module.on_dm(_dm_event('hi', user='U_OTHER'), slack_client)
+
+    popen_mock.assert_not_called()
+    slack_client.chat_postMessage.assert_called_once_with(
+        channel='D123',
+        thread_ts='1700000000.000001',
+        text=run_server_module.USER_ACCESS_DENIED_TEXT,
     )
     slack_client.chat_update.assert_not_called()
 
@@ -117,15 +173,63 @@ def test_claude_timeout_returns_timeout_message(run_server_module, slack_client,
     assert '시간 초과' in text
 
 
-def test_dm_from_bot_is_ignored(run_server_module, slack_client, monkeypatch):
-    """bot_id가 붙은 DM은 무시한다(봇 자신의 메시지 루프 방지)."""
+def test_dm_from_other_bot_is_accepted(run_server_module, slack_client, fake_claude_ok):
+    """다른 봇(Slack workflow 등)이 보낸 DM은 처리한다(자기 자신만 제외)."""
+    fake_claude_ok('bot dm ok')
+
+    event = _dm_event('echo')
+    event.pop('user', None)
+    event['bot_id'] = 'B_OTHER'
+
+    run_server_module.on_dm(event, slack_client)
+
+    assert slack_client.chat_update.called
+    assert 'bot dm ok' in slack_client.chat_update.call_args.kwargs['text']
+
+
+def test_dm_from_bot_in_disallowed_team_is_rejected(run_server_module, slack_client, monkeypatch):
+    """봇이라도 허용 팀에 없는 팀이면 거부한다(봇은 팀 검사만 받는다)."""
+    popen_mock = MagicMock()
+    monkeypatch.setattr(run_server_module.subprocess, 'Popen', popen_mock)
+
+    event = _dm_event('echo', team_id='T_OTHER')
+    event.pop('user', None)
+    event['bot_id'] = 'B_OTHER'
+
+    run_server_module.on_dm(event, slack_client)
+
+    popen_mock.assert_not_called()
+    slack_client.chat_postMessage.assert_called_once_with(
+        channel='D123',
+        thread_ts='1700000000.000001',
+        text=run_server_module.TEAM_ACCESS_DENIED_TEXT,
+    )
+    slack_client.chat_update.assert_not_called()
+
+
+def test_dm_from_self_bot_id_is_ignored(run_server_module, slack_client, monkeypatch):
+    """봇 자신의 bot_id로 들어온 DM은 무시한다(무한루프 방지)."""
     popen_mock = MagicMock()
     monkeypatch.setattr(run_server_module.subprocess, 'Popen', popen_mock)
 
     event = _dm_event('echo')
-    event['bot_id'] = 'B_OTHER'
+    event.pop('user', None)
+    event['bot_id'] = 'B1'  # context의 self bot_id와 동일
+    ctx = {'bot_id': 'B1', 'bot_user_id': 'UBOT'}
 
-    run_server_module.on_dm(event, slack_client)
+    run_server_module.on_dm(event, slack_client, ctx)
+
+    popen_mock.assert_not_called()
+    slack_client.chat_postMessage.assert_not_called()
+    slack_client.chat_update.assert_not_called()
+
+
+def test_dm_from_self_user_id_is_ignored(run_server_module, slack_client, monkeypatch):
+    """context가 없어도 BOT_USER_ID로 자기 자신 DM은 무시한다(폴백 방어)."""
+    popen_mock = MagicMock()
+    monkeypatch.setattr(run_server_module.subprocess, 'Popen', popen_mock)
+
+    run_server_module.on_dm(_dm_event('echo', user='UBOT'), slack_client)
 
     popen_mock.assert_not_called()
     slack_client.chat_postMessage.assert_not_called()

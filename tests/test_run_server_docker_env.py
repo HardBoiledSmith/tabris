@@ -25,10 +25,10 @@ def test_docker_cmd_includes_slack_user_id(monkeypatch, slack_client):
         'team_id': 'T_ALLOWED',
         'ts': '1700000000.000001',
         'thread_ts': '1700000000.000001',
-        'user': 'UTEST01',
+        'user': 'U_USER',
         'text': 'hello',
     }
     run_server.handle_request(event, slack_client)
 
     cmd = cmd_capture.get('cmd', [])
-    assert 'SLACK_USER_ID=UTEST01' in cmd, f'SLACK_USER_ID not found in docker cmd: {cmd}'
+    assert 'SLACK_USER_ID=U_USER' in cmd, f'SLACK_USER_ID not found in docker cmd: {cmd}'

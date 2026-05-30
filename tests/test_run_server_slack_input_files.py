@@ -176,6 +176,7 @@ def test_handle_request_file_only_invokes_run_claude(monkeypatch, slack_client):
         'channel': 'D123',
         'channel_type': 'im',
         'team_id': 'T_ALLOWED',
+        'user': 'U_USER',
         'thread_ts': '1700000000.000001',
         'text': '',
         'files': [

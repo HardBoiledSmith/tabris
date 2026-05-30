@@ -11,7 +11,9 @@ def _install_settings_local_stub() -> None:
     if 'settings_local' in sys.modules:
         return
     m = types.ModuleType('settings_local')
-    m.ALLOWED_TEAM_ID = 'T_ALLOWED'
+    m.ALLOWED_TEAM_IDS = 'T_ALLOWED'
+    m.ALLOWED_USER_IDS = 'U_USER'
+    m.ALLOWED_ALL_USER_TEAM_IDS = ''
     m.ANTHROPIC_API_KEY = 'sk-test'
     m.BOT_USER_ID = 'UBOT'
     m.CLAUDE_TIMEOUT = 30

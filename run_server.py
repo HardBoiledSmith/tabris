@@ -21,9 +21,11 @@ from slack_markdown_parser import convert_markdown_to_slack_blocks
 from slack_sdk.errors import SlackApiError
 
 from const import TEAM_ACCESS_DENIED_TEXT
+from const import USER_ACCESS_DENIED_TEXT
 
 sys.path.append('/etc/tabris')
-from settings_local import ALLOWED_TEAM_ID
+from settings_local import ALLOWED_TEAM_IDS
+from settings_local import ALLOWED_USER_IDS
 from settings_local import ANTHROPIC_API_KEY
 from settings_local import ARTIFACTS_BASE_URL
 from settings_local import ARTIFACTS_S3_BUCKET
@@ -141,14 +143,39 @@ def _enrich_event_team_id_for_acl(event: dict, context) -> dict:
     return merged
 
 
-def is_allowed_slack_team(event: dict) -> bool:
-    """메시지가 발생한 Slack 워크스페이스(team)가 ALLOWED_TEAM_ID와 일치하는지 본다.
+def _parse_ids(raw) -> frozenset:
+    """쉼표 구분 문자열 또는 (tuple/list/set) ID 모음을 정규화된 frozenset으로 만든다.
 
-    ALLOWED_TEAM_ID가 비어 있으면 검사하지 않는다(기존·로컬 호환).
+    프로비저닝은 'U1,U2' 형태 문자열로 주입하지만, 기존 튜플 설정도 그대로 수용한다.
+    """
+    if raw is None:
+        return frozenset()
+    items = raw if isinstance(raw, (list, tuple, set, frozenset)) else str(raw).split(',')
+    return frozenset(s.strip() for s in items if s and str(s).strip())
+
+
+# 운영 설정에 아직 없을 수 있으므로 방어적으로 import 한다(미반영 시에도 기동되게).
+try:
+    from settings_local import ALLOWED_ALL_USER_TEAM_IDS
+except ImportError:
+    ALLOWED_ALL_USER_TEAM_IDS = ''
+
+
+_ALLOWED_TEAM_IDS = _parse_ids(ALLOWED_TEAM_IDS)
+_ALLOWED_USER_IDS = _parse_ids(ALLOWED_USER_IDS)
+_ALLOWED_ALL_USER_TEAM_IDS = _parse_ids(ALLOWED_ALL_USER_TEAM_IDS)
+# 팀 게이트는 두 집합의 합집합 — 전원허용 팀을 ALLOWED_TEAM_IDS에 중복 기재할 필요 없다.
+_ALL_ALLOWED_TEAMS = _ALLOWED_TEAM_IDS | _ALLOWED_ALL_USER_TEAM_IDS
+
+
+def is_allowed_slack_team(event: dict) -> bool:
+    """메시지가 발생한 Slack 워크스페이스(team)가 허용 팀에 포함되는지 본다.
+
+    허용 팀(ALLOWED_TEAM_IDS ∪ ALLOWED_ALL_USER_TEAM_IDS)이 비어 있으면 검사하지 않는다(기존·로컬 호환).
     team_id를 알 수 없으면 안전하게 거부한다.
     """
 
-    if not ALLOWED_TEAM_ID:
+    if not _ALL_ALLOWED_TEAMS:
         return True
     tid = _normalize_slack_team_id(event.get('team_id') or event.get('team'))
     if not tid:
@@ -158,7 +185,65 @@ def is_allowed_slack_team(event: dict) -> bool:
             list(event.keys()),
         )
         return False
-    return tid == ALLOWED_TEAM_ID
+    return tid in _ALL_ALLOWED_TEAMS
+
+
+def _normalize_slack_user_id(raw):
+    """이벤트에서 읽은 user 필드를 문자열 User ID로 정규화한다."""
+    if raw is None:
+        return None
+    return str(raw).strip() or None
+
+
+def is_allowed_slack_user(event: dict) -> bool:
+    """사람(user) 발신자가 허용되는지 본다. 봇은 handle_request에서 호출 전 제외된다.
+
+    - 발신 팀이 ALLOWED_ALL_USER_TEAM_IDS면 그 팀 전원 허용.
+    - 그 외에는 ALLOWED_USER_IDS로 검사한다(비어 있으면 검사 생략, 기존·로컬 호환).
+    - user를 알 수 없으면 안전하게 거부한다.
+    """
+
+    tid = _normalize_slack_team_id(event.get('team_id') or event.get('team'))
+    if tid and tid in _ALLOWED_ALL_USER_TEAM_IDS:
+        return True
+    if not _ALLOWED_USER_IDS:
+        return True
+    uid = _normalize_slack_user_id(event.get('user'))
+    if not uid:
+        logger.warning(
+            'Slack event without user; denying. team=%s event_keys=%s',
+            tid,
+            list(event.keys()),
+        )
+        return False
+    return uid in _ALLOWED_USER_IDS
+
+
+def _is_self_event(event: dict, context=None) -> bool:
+    """이벤트가 이 봇 자신이 보낸 메시지면 True. 무한루프(자기 응답에 재반응) 방지.
+
+    Slack Bolt가 주입하는 context의 bot_id(B...)/bot_user_id(U...)와
+    이벤트의 bot_id/user를 대조한다. context가 없으면 BOT_USER_ID로만 방어한다.
+    """
+    self_bot_id = context.get('bot_id') if context else None
+    self_user_id = (context.get('bot_user_id') if context else None) or BOT_USER_ID
+
+    ev_bot_id = event.get('bot_id')
+    if self_bot_id and ev_bot_id and ev_bot_id == self_bot_id:
+        return True
+
+    ev_user_id = _normalize_slack_user_id(event.get('user'))
+    if self_user_id and ev_user_id and ev_user_id == self_user_id:
+        return True
+
+    return False
+
+
+def _post_access_denied(client, channel: str, thread_ts: str, text: str) -> None:
+    try:
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+    except Exception:
+        logger.exception('Failed to post access denied message')
 
 
 SLACK_MAX_BLOCKS_PER_MESSAGE = 50
@@ -982,10 +1067,13 @@ def handle_request(event: dict, client):
     )
 
     if not is_allowed_slack_team(event):
-        try:
-            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=TEAM_ACCESS_DENIED_TEXT)
-        except Exception:
-            logger.exception('Failed to post team access denied message')
+        _post_access_denied(client, channel, thread_ts, TEAM_ACCESS_DENIED_TEXT)
+        return
+
+    # 봇(bot_id 있음)은 팀 검사만 통과하면 허용한다(봇은 user_id가 없어 유저 목록 적용 불가).
+    # 사람은 팀 검사에 더해 유저 목록까지 검사한다. DM·멘션 모두 동일하게 적용.
+    if not event.get('bot_id') and not is_allowed_slack_user(event):
+        _post_access_denied(client, channel, thread_ts, USER_ACCESS_DENIED_TEXT)
         return
 
     container_name = _docker_container_name(thread_ts)
@@ -1075,7 +1163,7 @@ def handle_request(event: dict, client):
 
 @app.action('cancel_claude_run')
 def on_cancel_claude_run(ack, body, client):
-    """취소 버튼 클릭 → Docker 컨테이너를 중지한다. ALLOWED_TEAM_ID 검사를 포함한다."""
+    """취소 버튼 클릭 → Docker 컨테이너를 중지한다. ALLOWED_TEAM_IDS 검사를 포함한다."""
     ack()
 
     action_team_id = (body.get('team') or {}).get('id')
@@ -1137,6 +1225,8 @@ def _submit(event, client, context=None):
 
 @app.event('app_mention')
 def on_mention(event, client, context=None):
+    if _is_self_event(event, context):
+        return
     _submit(event, client, context)
 
 
@@ -1147,7 +1237,8 @@ def on_dm(event, client, context=None):
     subtype = event.get('subtype')
     if subtype and subtype not in SLACK_DM_ALLOWED_FILE_MESSAGE_SUBTYPES:
         return
-    if event.get('bot_id'):
+    # 자기 자신이 보낸 메시지만 차단(무한루프 방지). 그 외 봇(Slack workflow 등)은 허용.
+    if _is_self_event(event, context):
         return
     _submit(event, client, context)
 

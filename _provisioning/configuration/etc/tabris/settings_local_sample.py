@@ -1,4 +1,8 @@
-ALLOWED_TEAM_ID = 'T289HMD6H'
+# 허용 팀/사용자 (쉼표 구분 문자열). 빈 문자열이면 해당 검사 생략.
+# 봇/워크플로우는 user 목록과 무관하게 허용 팀에 포함되기만 하면 허용된다.
+ALLOWED_TEAM_IDS = 'T289HMD6H'  # 특정 user만 받는 허용 팀
+ALLOWED_USER_IDS = ''  # 허용 사용자(비우면 팀 내 전원 허용)
+ALLOWED_ALL_USER_TEAM_IDS = ''  # 이 팀들은 user 목록과 무관하게 전원 허용. 예: 'T289HMD6H,T319XXXXX'
 ANTHROPIC_API_KEY = 'sk-ant-...'
 BOT_USER_ID = 'U1234567'
 CLAUDE_TIMEOUT = 120
