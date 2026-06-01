@@ -27,6 +27,18 @@ def _dm_event(text: str = 'hi there', *, team_id: str = 'T_ALLOWED', user: str =
     }
 
 
+def _mpim_event(text: str = 'hi group', *, team_id: str = 'T_ALLOWED', user: str = 'U_USER') -> dict:
+    return {
+        'type': 'message',
+        'channel_type': 'mpim',
+        'channel': 'G123',
+        'user': user,
+        'team_id': team_id,
+        'ts': '1700000000.000003',
+        'text': text,
+    }
+
+
 def _mention_event(text: str = '<@UBOT> ping', *, team_id: str = 'T_ALLOWED', user: str = 'U_USER') -> dict:
     return {
         'type': 'app_mention',
@@ -233,6 +245,36 @@ def test_dm_from_self_user_id_is_ignored(run_server_module, slack_client, monkey
 
     popen_mock.assert_not_called()
     slack_client.chat_postMessage.assert_not_called()
+    slack_client.chat_update.assert_not_called()
+
+
+def test_mpim_plaintext_happy_path_posts_claude_result(run_server_module, slack_client, fake_claude_ok):
+    """그룹 DM(mpim)의 멘션 없는 평문도 `on_dm`을 통과해 Claude 응답이 게시된다."""
+    fake_claude_ok('그룹 응답')
+
+    run_server_module.on_dm(_mpim_event('hello group'), slack_client)
+
+    post_calls = slack_client.chat_postMessage.call_args_list
+    waiting_call = [c for c in post_calls if c.kwargs.get('text') == '⏳ 처리 중...']
+    assert waiting_call, '대기 메시지가 게시되어야 한다'
+    assert waiting_call[0].kwargs['channel'] == 'G123'
+    assert slack_client.chat_update.called, 'Claude 응답이 대기 메시지를 갱신해야 한다'
+    assert '그룹 응답' in slack_client.chat_update.call_args.kwargs['text']
+
+
+def test_disallowed_user_is_rejected_on_mpim(run_server_module, slack_client, monkeypatch):
+    """그룹 DM 경로도 사람(user)에는 ALLOWED_USER_IDS를 적용해 미허용 user를 거부한다."""
+    popen_mock = MagicMock()
+    monkeypatch.setattr(run_server_module.subprocess, 'Popen', popen_mock)
+
+    run_server_module.on_dm(_mpim_event('hi', user='U_OTHER'), slack_client)
+
+    popen_mock.assert_not_called()
+    slack_client.chat_postMessage.assert_called_once_with(
+        channel='G123',
+        thread_ts='1700000000.000003',
+        text=run_server_module.USER_ACCESS_DENIED_TEXT,
+    )
     slack_client.chat_update.assert_not_called()
 
 

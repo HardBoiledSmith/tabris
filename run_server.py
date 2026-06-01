@@ -60,6 +60,14 @@ WORKSPACE_INPUT_SUBDIR = 'input'
 # DM에서 파일 공유만 있는 메시지 subtype. 그 외 subtype은 무시한다.
 SLACK_DM_ALLOWED_FILE_MESSAGE_SUBTYPES = frozenset({'file_share'})
 
+# 봇이 멤버인 1:1 DM('im')과 그룹 DM('mpim')을 DM류로 동일 취급한다.
+SLACK_DM_CHANNEL_TYPES = frozenset({'im', 'mpim'})
+
+
+def _is_dm_channel(event: dict) -> bool:
+    return event.get('channel_type') in SLACK_DM_CHANNEL_TYPES
+
+
 # Docker 이미지에 포함된 Claude 설정(MCP 등). 워크스페이스 마운트와 무관하다.
 CLAUDE_CONFIG_IN_CONTAINER = '/home/claude/.claude.json'
 # Dockerfile `useradd -u 1001 claude`와 동기화. 바인드 마운트는 호스트 inode 권한을 따른다.
@@ -798,7 +806,7 @@ def sync_memory_to_s3(user_id: str, memory_dir: str, creds: dict) -> None:
 def run_claude(event: dict, context: str, request: str, progress_callback=None) -> tuple[bool, str]:
     thread_ts = event.get('thread_ts') or event.get('ts')
     msg_id = event.get('client_msg_id') or event.get('ts')
-    is_dm = event.get('channel_type') == 'im'
+    is_dm = _is_dm_channel(event)
     slack_user_id = event.get('user') or event.get('bot_id')
     if not slack_user_id:
         logger.error('run_claude: event missing user ID and bot_id')
@@ -1042,7 +1050,7 @@ def handle_request(event: dict, client):
         logger.error("handle_request: event missing 'channel': %s", event)
         return
 
-    is_dm = event.get('channel_type') == 'im'
+    is_dm = _is_dm_channel(event)
     thread_ts = event.get('thread_ts') or event.get('ts')
     msg_id = event.get('client_msg_id') or event.get('ts')
     user_request = event.get('text', '').replace(f'<@{BOT_USER_ID}>', '').strip()
@@ -1232,7 +1240,7 @@ def on_mention(event, client, context=None):
 
 @app.event('message')
 def on_dm(event, client, context=None):
-    if event.get('channel_type') != 'im':
+    if not _is_dm_channel(event):  # 'im'(1:1) 또는 'mpim'(그룹 DM)
         return
     subtype = event.get('subtype')
     if subtype and subtype not in SLACK_DM_ALLOWED_FILE_MESSAGE_SUBTYPES:

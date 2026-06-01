@@ -46,6 +46,7 @@ Slack Bolt (Socket Mode) 기반 봇. 사용자의 멘션/DM에 응답하여 Dock
                 "groups:history",
                 "groups:read",
                 "im:history",
+                "mpim:history",
                 "users:read"
             ]
         },
@@ -55,7 +56,8 @@ Slack Bolt (Socket Mode) 기반 봇. 사용자의 멘션/DM에 응답하여 Dock
         "event_subscriptions": {
             "bot_events": [
                 "app_mention",
-                "message.im"
+                "message.im",
+                "message.mpim"
             ]
         },
         "interactivity": {
