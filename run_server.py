@@ -32,12 +32,12 @@ from settings_local import ARTIFACTS_S3_BUCKET
 from settings_local import BOT_USER_ID
 from settings_local import CLAUDE_TIMEOUT
 from settings_local import DOCKER_IMAGE
+from settings_local import DOCUMENTS_S3_BUCKET
 from settings_local import GITHUB_PAT
 from settings_local import JIRA_API_KEY
 from settings_local import JIRA_API_USERNAME
 from settings_local import MAX_WORKERS
 from settings_local import MEMORY_S3_BUCKET
-from settings_local import MEMORY_S3_SYNC_ENABLED
 from settings_local import MEMORY_S3_SYNC_TIMEOUT
 from settings_local import NERV_MCP_TOKEN
 from settings_local import SENTRY_AUTH_TOKEN
@@ -49,6 +49,40 @@ ATLASSIAN_ROVO_MCP_TOKEN = base64.b64encode(f'{JIRA_API_USERNAME}:{JIRA_API_KEY}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# REQUEST/RESPONSE 이벤트를 사람용 key=value 로그와 별개로 JSON Lines 파일에도 남긴다.
+# CloudWatch Logs로 수집해 Logs Insights로 사용자별 토큰/비용을 집계하기 위한 용도.
+# 파일명이 *.log 라 기존 /etc/logrotate.d/tabris(copytruncate) 규칙으로 자동 회전된다.
+EVENT_LOG_PATH = os.environ.get('TABRIS_EVENT_LOG_PATH', '/var/log/tabris/events.jsonl.log')
+event_logger = logging.getLogger('tabris.events')
+event_logger.setLevel(logging.INFO)
+event_logger.propagate = False  # 메인 run_server.log로 새지 않게 한다.
+try:
+    _event_handler = logging.FileHandler(EVENT_LOG_PATH, encoding='utf-8')
+    _event_handler.setFormatter(logging.Formatter('%(message)s'))  # 라인 전체가 순수 JSON이 되도록
+    event_logger.addHandler(_event_handler)
+except OSError:
+    logger.warning('이벤트 JSON 로그 파일을 열 수 없어 비활성화한다: %s', EVENT_LOG_PATH, exc_info=True)
+
+
+def _log_event_json(payload: dict) -> None:
+    """이벤트 한 건을 JSON 한 줄로 events 로그에 남긴다. 실패해도 본 처리 흐름에 영향 주지 않는다."""
+    record = {'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), **payload}
+    try:
+        event_logger.info(json.dumps(record, ensure_ascii=False, separators=(',', ':')))
+    except Exception:
+        logger.warning('이벤트 JSON 로깅 실패', exc_info=True)
+
+
+def _primary_model(model_usage) -> str | None:
+    """Claude JSON 출력의 modelUsage에서 응답을 주도한 메인 모델 이름을 고른다.
+
+    보조 모델(예: 제목 생성용 haiku)이 함께 잡히므로, 큰 컨텍스트를 처리해
+    비용을 지배하는 메인 모델을 costUSD 기준 최댓값으로 선택한다.
+    """
+    if not isinstance(model_usage, dict) or not model_usage:
+        return None
+    return max(model_usage.items(), key=lambda kv: (kv[1] or {}).get('costUSD', 0))[0]
 
 ARTIFACT_MAX_FILES = 10
 ARTIFACT_MAX_BYTES_PER_FILE = 1_073_741_824  # 1 GiB
@@ -77,6 +111,9 @@ CLAUDE_CONTAINER_GID = 1001
 EC2_IMDS_BASE = 'http://169.254.169.254/latest'
 EC2_IMDS_TOKEN_TTL_SECONDS = '21600'
 AWS_DEFAULT_REGION = 'ap-northeast-2'
+# IMDS 조회 실패 시(=로컬/Vagrant 개발환경) 폴백으로 사용할 aws CLI 프로파일.
+# prod EC2에서는 IMDS가 성공하므로 이 경로는 실행되지 않는다.
+AWS_FALLBACK_PROFILE = 'hbsmith-dv'
 
 # 사용자별 Claude memory 호스트 경로. runs/는 스레드별 임시 workspace.
 SANDBOX_ROOT = '/tmp/claude-sandbox'
@@ -750,6 +787,32 @@ def fetch_ec2_instance_role_credentials() -> dict[str, str]:
     }
 
 
+def fetch_credentials_via_aws_profile(profile: str) -> dict[str, str]:
+    """aws CLI 프로파일로 임시 AWS 자격증명을 조회한다(로컬/Vagrant 개발환경 폴백).
+
+    `aws configure export-credentials`는 CLI의 자격증명 resolution(SSO 포함)을 그대로 태운다.
+    SSO 세션이 만료된 경우 `aws sso login --profile <profile>`이 필요하다.
+    """
+    result = subprocess.run(
+        [_aws_cli_executable(), 'configure', 'export-credentials', '--profile', profile, '--format', 'process'],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f'aws export-credentials 실패(profile={profile}). '
+            f'SSO 만료일 수 있음 → `aws sso login --profile {profile}` 확인 필요. {result.stderr.strip()[:300]}'
+        )
+    payload = json.loads(result.stdout)
+    return {
+        'AWS_ACCESS_KEY_ID': payload['AccessKeyId'],
+        'AWS_SECRET_ACCESS_KEY': payload['SecretAccessKey'],
+        'AWS_SESSION_TOKEN': payload['SessionToken'],
+    }
+
+
 def _aws_cli_executable() -> str:
     """호스트에 설치된 aws CLI 경로를 반환한다."""
     path = shutil.which('aws')
@@ -783,8 +846,8 @@ def _aws_s3_sync(src: str, dst: str, creds: dict, *, delete: bool = False) -> No
 
 
 def sync_memory_from_s3(user_id: str, memory_dir: str, creds: dict) -> None:
-    """S3 → 로컬 memory 디렉터리로 동기화한다. MEMORY_S3_SYNC_ENABLED=False면 no-op."""
-    if not MEMORY_S3_SYNC_ENABLED:
+    """S3 → 로컬 memory 디렉터리로 동기화한다. MEMORY_S3_BUCKET 미설정이면 no-op."""
+    if not MEMORY_S3_BUCKET:
         return
     s3_uri = f's3://{MEMORY_S3_BUCKET}/users/{user_id}/'
     logger.info('Syncing memory from S3: %s -> %s', s3_uri, memory_dir)
@@ -792,8 +855,8 @@ def sync_memory_from_s3(user_id: str, memory_dir: str, creds: dict) -> None:
 
 
 def sync_memory_to_s3(user_id: str, memory_dir: str, creds: dict) -> None:
-    """로컬 memory → S3 미러 동기화. 로컬에 없는 S3 객체는 --delete로 제거한다."""
-    if not MEMORY_S3_SYNC_ENABLED:
+    """로컬 memory → S3 미러 동기화. MEMORY_S3_BUCKET 미설정이면 no-op. 로컬에 없는 S3 객체는 --delete로 제거한다."""
+    if not MEMORY_S3_BUCKET:
         return
     if not _memory_dir_has_files(memory_dir):
         logger.warning('Skipping memory upload: empty memory_dir for user %s', user_id)
@@ -855,8 +918,13 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
         try:
             aws_creds = fetch_ec2_instance_role_credentials()
         except (OSError, urllib.error.HTTPError, urllib.error.URLError, RuntimeError, KeyError) as exc:
-            logger.exception('Failed to fetch EC2 instance role credentials from IMDS')
-            return False, f'⚠️ AWS 자격증명 조회 실패(IMDS): {exc}'
+            # IMDS 실패 = 로컬/Vagrant 개발환경. aws CLI 프로파일로 폴백한다.
+            logger.warning('IMDS 자격증명 실패, 프로파일 폴백 시도(%s): %s', AWS_FALLBACK_PROFILE, exc)
+            try:
+                aws_creds = fetch_credentials_via_aws_profile(AWS_FALLBACK_PROFILE)
+            except (subprocess.SubprocessError, OSError, RuntimeError, KeyError, ValueError) as fb_exc:
+                logger.exception('Failed to fetch AWS credentials from both IMDS and aws profile')
+                return False, f'⚠️ AWS 자격증명 조회 실패(IMDS·프로파일 모두): {fb_exc}'
 
         with _user_memory_lock(slack_user_id):
             try:
@@ -940,6 +1008,10 @@ def _run_claude_docker(
         f'ARTIFACTS_S3_BUCKET={ARTIFACTS_S3_BUCKET}',
         '-e',
         f'ARTIFACTS_BASE_URL={ARTIFACTS_BASE_URL}',
+        '-e',
+        f'DOCUMENTS_S3_BUCKET={DOCUMENTS_S3_BUCKET}',
+        '-e',
+        f'MEMORY_S3_BUCKET={MEMORY_S3_BUCKET}',
         '--workdir',
         '/workspace',
         DOCKER_IMAGE,
@@ -950,7 +1022,7 @@ def _run_claude_docker(
         CLAUDE_CONFIG_IN_CONTAINER,
         '--dangerously-skip-permissions',
         '--output-format',
-        'text',
+        'json',
     ]
 
     process = subprocess.Popen(
@@ -1025,20 +1097,64 @@ def _run_claude_docker(
         logger.error('Claude exited with code %d: %s', process.returncode, stderr)
         return process.returncode, f'⚠️ 실행 오류:\n```{stderr[:300]}```'
 
-    text_out = stdout.strip()
+    raw_out = stdout.strip()
+    if not raw_out:
+        return process.returncode, '⚠️ 응답이 비어 있습니다.'
+
+    # --output-format json: stdout은 단일 JSON 객체다. result를 본문으로, usage를 로그로 쓴다.
+    # 예기치 못한 평문 출력 등 파싱 실패 시 본문을 잃지 않도록 raw stdout으로 폴백한다.
+    text_out = raw_out
+    total_cost_usd = None
+    input_tokens = None
+    output_tokens = None
+    model = None
+    try:
+        payload = json.loads(raw_out)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning('Claude JSON 출력 파싱 실패; raw stdout으로 폴백한다.')
+    else:
+        text_out = (payload.get('result') or '').strip()
+        usage = payload.get('usage') or {}
+        total_cost_usd = payload.get('total_cost_usd', payload.get('cost_usd'))
+        input_tokens = usage.get('input_tokens')
+        output_tokens = usage.get('output_tokens')
+        model = _primary_model(payload.get('modelUsage'))
+
     if not text_out:
         return process.returncode, '⚠️ 응답이 비어 있습니다.'
 
-    output_length = len(text_out)
+    resp_type = 'DM' if is_dm else 'mention'
+    resp_team_id = _normalize_slack_team_id(event.get('team_id') or event.get('team'))
+    resp_user = event.get('user') or event.get('bot_id')
+    cost_display = f'{total_cost_usd:.6f}' if isinstance(total_cost_usd, (int, float)) else 'N/A'
     logger.info(
-        '[RESPONSE] type=%s team_id=%s channel=%s thread_ts=%s user=%s msg_id=%s output_length=%d',
-        'DM' if is_dm else 'mention',
-        _normalize_slack_team_id(event.get('team_id') or event.get('team')),
+        '[RESPONSE] type=%s team_id=%s channel=%s thread_ts=%s user=%s msg_id=%s '
+        'model=%s total_cost_usd=%s input_tokens=%s output_tokens=%s',
+        resp_type,
+        resp_team_id,
         event.get('channel'),
         thread_ts,
-        event.get('user') or event.get('bot_id'),
+        resp_user,
         msg_id,
-        output_length,
+        model,
+        cost_display,
+        input_tokens,
+        output_tokens,
+    )
+    _log_event_json(
+        {
+            'evt': 'response',
+            'type': resp_type,
+            'team_id': resp_team_id,
+            'channel': event.get('channel'),
+            'thread_ts': thread_ts,
+            'user': resp_user,
+            'msg_id': msg_id,
+            'model': model,
+            'total_cost_usd': total_cost_usd,
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+        }
     )
     return process.returncode, text_out
 
@@ -1063,15 +1179,29 @@ def handle_request(event: dict, client):
         user_request = '(이 메시지에는 텍스트가 없고 Slack 첨부만 있다. `/workspace/input/`의 파일을 읽고 처리해 달라.)'
 
     msg_type = 'DM' if is_dm else 'mention'
+    req_team_id = _normalize_slack_team_id(event.get('team_id') or event.get('team'))
+    req_user = event.get('user') or event.get('bot_id')
     logger.info(
         '[REQUEST] type=%s team_id=%s channel=%s thread_ts=%s user=%s msg_id=%s text=%r',
         msg_type,
-        _normalize_slack_team_id(event.get('team_id') or event.get('team')),
+        req_team_id,
         channel,
         thread_ts,
-        event.get('user') or event.get('bot_id'),
+        req_user,
         msg_id,
         user_request,
+    )
+    _log_event_json(
+        {
+            'evt': 'request',
+            'type': msg_type,
+            'team_id': req_team_id,
+            'channel': channel,
+            'thread_ts': thread_ts,
+            'user': req_user,
+            'msg_id': msg_id,
+            'text': user_request,
+        }
     )
 
     if not is_allowed_slack_team(event):
@@ -1199,6 +1329,8 @@ def on_cancel_claude_run(ack, body, client):
     user_id = body['user']['id']
     channel = body['channel']['id']
     message_ts = body['message']['ts']
+    thread_ts = body['message'].get('thread_ts') or message_ts
+    cancel_team_id = _normalize_slack_team_id(action_team_id)
 
     try:
         result = subprocess.run(
@@ -1208,12 +1340,36 @@ def on_cancel_claude_run(ack, body, client):
             timeout=15,
         )
         if result.returncode == 0:
+            cancel_result = 'stopped'
             cancel_text = f'🛑 <@{user_id}>님이 작업을 취소했습니다.'
         else:
+            cancel_result = 'not_found'
             cancel_text = '⚠️ 취소 실패: 이미 종료되었거나 컨테이너를 찾을 수 없습니다.'
     except Exception as exc:
         logger.exception('docker stop failed for %s', container_name)
+        cancel_result = 'error'
         cancel_text = f'⚠️ 취소 중 오류: {exc}'
+
+    logger.info(
+        '[CANCEL] team_id=%s channel=%s thread_ts=%s user=%s container=%s result=%s',
+        cancel_team_id,
+        channel,
+        thread_ts,
+        user_id,
+        container_name,
+        cancel_result,
+    )
+    _log_event_json(
+        {
+            'evt': 'cancel',
+            'team_id': cancel_team_id,
+            'channel': channel,
+            'thread_ts': thread_ts,
+            'user': user_id,
+            'container': container_name,
+            'result': cancel_result,
+        }
+    )
 
     try:
         client.chat_update(channel=channel, ts=message_ts, text=cancel_text, blocks=[])

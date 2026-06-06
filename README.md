@@ -167,15 +167,14 @@ vagrant destroy -f     # VM 완전 삭제
 | `DOCKER_IMAGE` |   | `hbsmith-claude-sandbox` | sandbox 이미지명 |
 | `CLAUDE_TIMEOUT` |   | `120` | Claude 실행 타임아웃(초) |
 | `MAX_WORKERS` |   | `5` | 동시 처리 스레드 수 |
-| `MEMORY_S3_BUCKET` |   | `hbsmith-tabris-memory` | 사용자별 memory S3 버킷명 |
-| `MEMORY_S3_SYNC_ENABLED` |   | `True` | S3 sync 활성화 여부. 로컬·Vagrant는 `False`로 설정 |
+| `MEMORY_S3_BUCKET` |   | `hbsmith-tabris-memory` | 사용자별 memory S3 버킷명. **빈 문자열이면 S3 sync 기능 비활성화** (로컬·Vagrant) |
 | `MEMORY_S3_SYNC_TIMEOUT` |   | `60` | `aws s3 sync` subprocess 타임아웃(초) |
 
 VM에서는 `/etc/tabris/settings_local.py`에 Python 상수로 정의한다. 로컬 개발 시에도 동일하게 `settings_local`를 import할 수 있는 경로에 두면 된다.
 
 ## 인프라 선행 조건 (운영 배포 시 필수)
 
-`MEMORY_S3_SYNC_ENABLED = True`로 운영하려면 아래가 갖춰져 있어야 한다.
+`MEMORY_S3_BUCKET`을 설정해 memory S3 sync를 운영하려면 아래가 갖춰져 있어야 한다.
 
 1. **S3 버킷** `hbsmith-tabris-memory` 생성 (리전 `ap-northeast-2`, Block Public Access, SSE-S3 이상)
 2. **tabris EC2 instance profile** IAM policy 추가:

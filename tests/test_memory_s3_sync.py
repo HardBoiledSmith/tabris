@@ -87,9 +87,9 @@ def test_memory_dir_has_files(tmp_path):
     assert run_server._memory_dir_has_files(str(with_files)) is True
 
 
-def test_sync_memory_from_s3_noop_when_disabled(tmp_path, monkeypatch):
-    """MEMORY_S3_SYNC_ENABLED=False이면 subprocess.run이 호출되지 않는다."""
-    monkeypatch.setattr(run_server, 'MEMORY_S3_SYNC_ENABLED', False)
+def test_sync_memory_from_s3_noop_when_bucket_unset(tmp_path, monkeypatch):
+    """MEMORY_S3_BUCKET이 비어 있으면 subprocess.run이 호출되지 않는다."""
+    monkeypatch.setattr(run_server, 'MEMORY_S3_BUCKET', '')
 
     with patch.object(run_server.subprocess, 'run') as mock_run:
         run_server.sync_memory_from_s3('UTEST', str(tmp_path), _TEST_CREDS)
@@ -97,9 +97,9 @@ def test_sync_memory_from_s3_noop_when_disabled(tmp_path, monkeypatch):
     mock_run.assert_not_called()
 
 
-def test_sync_memory_to_s3_noop_when_disabled(tmp_path, monkeypatch):
-    """MEMORY_S3_SYNC_ENABLED=False이면 subprocess.run이 호출되지 않는다."""
-    monkeypatch.setattr(run_server, 'MEMORY_S3_SYNC_ENABLED', False)
+def test_sync_memory_to_s3_noop_when_bucket_unset(tmp_path, monkeypatch):
+    """MEMORY_S3_BUCKET이 비어 있으면 subprocess.run이 호출되지 않는다."""
+    monkeypatch.setattr(run_server, 'MEMORY_S3_BUCKET', '')
 
     with patch.object(run_server.subprocess, 'run') as mock_run:
         run_server.sync_memory_to_s3('UTEST', str(tmp_path), _TEST_CREDS)
@@ -109,7 +109,7 @@ def test_sync_memory_to_s3_noop_when_disabled(tmp_path, monkeypatch):
 
 def test_sync_memory_to_s3_skips_empty_memory_dir(tmp_path, monkeypatch):
     """로컬 memory가 비어 있으면 S3 업로드(sync)를 하지 않는다."""
-    monkeypatch.setattr(run_server, 'MEMORY_S3_SYNC_ENABLED', True)
+    monkeypatch.setattr(run_server, 'MEMORY_S3_BUCKET', 'hbsmith-tabris-memory')
     memory_dir = str(tmp_path / 'memory')
     memory_dir_path = tmp_path / 'memory'
     memory_dir_path.mkdir()
@@ -122,7 +122,7 @@ def test_sync_memory_to_s3_skips_empty_memory_dir(tmp_path, monkeypatch):
 
 def test_sync_memory_from_s3_uses_correct_s3_uri(tmp_path, monkeypatch):
     """sync_memory_from_s3가 올바른 S3 URI와 로컬 경로로 sync를 호출한다."""
-    monkeypatch.setattr(run_server, 'MEMORY_S3_SYNC_ENABLED', True)
+    monkeypatch.setattr(run_server, 'MEMORY_S3_BUCKET', 'hbsmith-tabris-memory')
     memory_dir = str(tmp_path)
     sync_calls: list[tuple[str, str, bool]] = []
 
@@ -141,7 +141,7 @@ def test_sync_memory_from_s3_uses_correct_s3_uri(tmp_path, monkeypatch):
 
 def test_sync_memory_to_s3_uses_correct_s3_uri_and_delete(tmp_path, monkeypatch):
     """sync_memory_to_s3가 로컬→S3 sync를 delete=True로 호출한다."""
-    monkeypatch.setattr(run_server, 'MEMORY_S3_SYNC_ENABLED', True)
+    monkeypatch.setattr(run_server, 'MEMORY_S3_BUCKET', 'hbsmith-tabris-memory')
     memory_dir = str(tmp_path)
     (tmp_path / 'memory.md').write_text('data', encoding='utf-8')
     sync_calls: list[tuple[str, str, bool]] = []
@@ -174,7 +174,6 @@ def test_run_claude_returns_error_when_user_missing(monkeypatch):
 
 def test_run_claude_s3_download_failure_blocks_docker(monkeypatch, tmp_path):
     """S3 download가 실패하면 docker를 실행하지 않고 오류 문자열을 반환한다."""
-    monkeypatch.setattr(run_server, 'MEMORY_S3_SYNC_ENABLED', True)
     monkeypatch.setattr(
         run_server,
         'sync_memory_from_s3',

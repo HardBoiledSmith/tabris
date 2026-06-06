@@ -61,13 +61,13 @@ echo "✅ AWS CLI 및 환경 변수 자격 증명 확인 완료"
 아래 화이트리스트에 모두 매치되면 role chain을 건너뛰고 환경 변수 자격 증명으로 바로 실행한다.
 
 **허용 대상 (billing 계정 591379657681):**
-- 버킷: `hbsmith-tabris-documents` 단 하나
+- 버킷: 환경 변수 **`$DOCUMENTS_S3_BUCKET`** 에 지정된 버킷 단 하나 (미설정이면 Fast Path 비적용 → Step 3 chain으로 진행)
 - 허용 명령 (read-only, 다운로드/조회만):
-  - `aws s3 ls s3://hbsmith-tabris-documents[/...]`
-  - `aws s3 cp s3://hbsmith-tabris-documents/<key> <로컬경로>` (다운로드 방향만)
-  - `aws s3api list-objects` / `list-objects-v2` / `list-object-versions` (`--bucket hbsmith-tabris-documents`)
-  - `aws s3api get-object` (`--bucket hbsmith-tabris-documents`)
-  - `aws s3api head-object` / `head-bucket` / `get-bucket-location` (`--bucket hbsmith-tabris-documents`)
+  - `aws s3 ls s3://$DOCUMENTS_S3_BUCKET[/...]`
+  - `aws s3 cp s3://$DOCUMENTS_S3_BUCKET/<key> <로컬경로>` (다운로드 방향만)
+  - `aws s3api list-objects` / `list-objects-v2` / `list-object-versions` (`--bucket $DOCUMENTS_S3_BUCKET`)
+  - `aws s3api get-object` (`--bucket $DOCUMENTS_S3_BUCKET`)
+  - `aws s3api head-object` / `head-bucket` / `get-bucket-location` (`--bucket $DOCUMENTS_S3_BUCKET`)
 
 **Fast Path 비적용 (= 기존 chain으로 진행):**
 - 다른 버킷, 다른 계정
