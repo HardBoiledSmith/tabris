@@ -1329,6 +1329,8 @@ def on_cancel_claude_run(ack, body, client):
     user_id = body['user']['id']
     channel = body['channel']['id']
     message_ts = body['message']['ts']
+    thread_ts = body['message'].get('thread_ts') or message_ts
+    cancel_team_id = _normalize_slack_team_id(action_team_id)
 
     try:
         result = subprocess.run(
@@ -1338,12 +1340,36 @@ def on_cancel_claude_run(ack, body, client):
             timeout=15,
         )
         if result.returncode == 0:
+            cancel_result = 'stopped'
             cancel_text = f'🛑 <@{user_id}>님이 작업을 취소했습니다.'
         else:
+            cancel_result = 'not_found'
             cancel_text = '⚠️ 취소 실패: 이미 종료되었거나 컨테이너를 찾을 수 없습니다.'
     except Exception as exc:
         logger.exception('docker stop failed for %s', container_name)
+        cancel_result = 'error'
         cancel_text = f'⚠️ 취소 중 오류: {exc}'
+
+    logger.info(
+        '[CANCEL] team_id=%s channel=%s thread_ts=%s user=%s container=%s result=%s',
+        cancel_team_id,
+        channel,
+        thread_ts,
+        user_id,
+        container_name,
+        cancel_result,
+    )
+    _log_event_json(
+        {
+            'evt': 'cancel',
+            'team_id': cancel_team_id,
+            'channel': channel,
+            'thread_ts': thread_ts,
+            'user': user_id,
+            'container': container_name,
+            'result': cancel_result,
+        }
+    )
 
     try:
         client.chat_update(channel=channel, ts=message_ts, text=cancel_text, blocks=[])

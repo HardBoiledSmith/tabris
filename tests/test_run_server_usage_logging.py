@@ -1,6 +1,7 @@
 """`--output-format json` 응답에서 본문(result)을 뽑고 usage를 RESPONSE 로그에 남기는지 검증한다."""
 
 import logging
+from unittest.mock import MagicMock
 
 from tests.helpers import install_claude_popen_mock
 
@@ -14,6 +15,17 @@ def _dm_event(text: str = 'hi') -> dict:
         'team_id': 'T_ALLOWED',
         'ts': '1700000000.000001',
         'text': text,
+    }
+
+
+def _cancel_body(*, team_id: str = 'T_ALLOWED') -> dict:
+    """취소 버튼 클릭(block_actions) 페이로드를 흉내낸다."""
+    return {
+        'team': {'id': team_id},
+        'user': {'id': 'U_CANCELLER'},
+        'channel': {'id': 'D123'},
+        'message': {'ts': '1700000000.000100', 'thread_ts': '1700000000.000001'},
+        'actions': [{'value': 'claude-1700000000-000001'}],
     }
 
 
@@ -88,3 +100,55 @@ def test_response_log_falls_back_on_non_json_stdout(monkeypatch, run_server_modu
     assert 'plain text answer' in slack_client.chat_update.call_args.kwargs['text']
     response_logs = [r.getMessage() for r in caplog.records if '[RESPONSE]' in r.getMessage()]
     assert response_logs and 'total_cost_usd=N/A' in response_logs[0]
+
+
+def test_cancel_logs_and_event_json_on_success(monkeypatch, run_server_module, slack_client, caplog, event_log_lines):
+    """취소 성공 시 [CANCEL] key=value 로그와 cancel JSON 이벤트가 같은 내용으로 남는다."""
+    monkeypatch.setattr(
+        run_server_module.subprocess,
+        'run',
+        MagicMock(return_value=MagicMock(returncode=0)),
+    )
+
+    with caplog.at_level(logging.INFO, logger='run_server'):
+        run_server_module.on_cancel_claude_run(MagicMock(), _cancel_body(), slack_client)
+
+    cancel_logs = [r.getMessage() for r in caplog.records if '[CANCEL]' in r.getMessage()]
+    assert cancel_logs, '[CANCEL] 로그가 남아야 한다'
+    assert 'user=U_CANCELLER' in cancel_logs[0]
+    assert 'result=stopped' in cancel_logs[0]
+
+    cancel_events = [e for e in event_log_lines() if e.get('evt') == 'cancel']
+    assert cancel_events, 'cancel JSON 이벤트가 있어야 한다'
+    ev = cancel_events[0]
+    assert ev['user'] == 'U_CANCELLER'
+    assert ev['team_id'] == 'T_ALLOWED'
+    assert ev['thread_ts'] == '1700000000.000001'
+    assert ev['result'] == 'stopped'
+    assert ev['container'] == 'claude-1700000000-000001'
+
+
+def test_cancel_event_result_not_found_when_container_gone(
+    monkeypatch, run_server_module, slack_client, event_log_lines
+):
+    """이미 종료된 컨테이너(docker stop 실패)는 result=not_found 로 기록된다."""
+    monkeypatch.setattr(
+        run_server_module.subprocess,
+        'run',
+        MagicMock(return_value=MagicMock(returncode=1)),
+    )
+
+    run_server_module.on_cancel_claude_run(MagicMock(), _cancel_body(), slack_client)
+
+    cancel_events = [e for e in event_log_lines() if e.get('evt') == 'cancel']
+    assert cancel_events and cancel_events[0]['result'] == 'not_found'
+
+
+def test_cancel_denied_for_disallowed_team_does_not_stop(monkeypatch, run_server_module, slack_client):
+    """허용되지 않은 팀의 취소는 docker stop을 호출하지 않는다(가드 유지)."""
+    run_mock = MagicMock()
+    monkeypatch.setattr(run_server_module.subprocess, 'run', run_mock)
+
+    run_server_module.on_cancel_claude_run(MagicMock(), _cancel_body(team_id='T_OTHER'), slack_client)
+
+    run_mock.assert_not_called()
