@@ -63,5 +63,7 @@ def test_docker_cmd_includes_bucket_env(monkeypatch, slack_client):
     run_server.handle_request(event, slack_client)
 
     cmd = cmd_capture.get('cmd', [])
-    assert f'DOCUMENTS_S3_BUCKET={run_server.DOCUMENTS_S3_BUCKET}' in cmd, f'DOCUMENTS_S3_BUCKET not in docker cmd: {cmd}'
+    assert (
+        f'DOCUMENTS_S3_BUCKET={run_server.DOCUMENTS_S3_BUCKET}' in cmd
+    ), f'DOCUMENTS_S3_BUCKET not in docker cmd: {cmd}'
     assert 'MEMORY_S3_BUCKET=mem-bucket-test' in cmd, f'MEMORY_S3_BUCKET not in docker cmd: {cmd}'
