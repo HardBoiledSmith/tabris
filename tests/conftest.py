@@ -9,8 +9,8 @@ from unittest.mock import patch
 
 import pytest
 
-# run_server import 전에 이벤트 JSON 로그 경로를 tmp로 돌린다(실 /var/log 오염 방지).
-# FileHandler가 모듈 로드 시점에 열리므로 import보다 먼저 설정해야 한다.
+# sandbox_worker import 전에 이벤트 JSON 로그 경로를 tmp 파일로 돌린다(stdout 대신).
+# 워커의 이벤트 FileHandler가 모듈 로드 시점에 열리므로 import보다 먼저 설정해야 한다.
 EVENT_LOG_PATH = os.path.join(tempfile.gettempdir(), 'tabris_test_events.jsonl.log')
 os.environ['TABRIS_EVENT_LOG_PATH'] = EVENT_LOG_PATH
 try:
@@ -29,7 +29,6 @@ def _install_settings_local_stub() -> None:
     m.ANTHROPIC_API_KEY = 'sk-test'
     m.BOT_USER_ID = 'UBOT'
     m.CLAUDE_TIMEOUT = 30
-    m.DOCKER_IMAGE = 'test-image'
     m.GITHUB_PAT = 'ghp-test'
     m.JIRA_API_KEY = 'jira-key'
     m.JIRA_API_USERNAME = 'jira-user'
@@ -39,10 +38,16 @@ def _install_settings_local_stub() -> None:
     m.SLACK_APP_TOKEN = 'xapp-test'
     m.SLACK_BOT_TOKEN = 'xoxb-test'
     m.MEMORY_S3_BUCKET = ''  # 빈 값 = memory S3 동기화 비활성 (테스트 기본)
-    m.MEMORY_S3_SYNC_TIMEOUT = 60
     m.ARTIFACTS_S3_BUCKET = 'hbsmith-tabris-artifacts'
     m.ARTIFACTS_BASE_URL = 'https://tabris-artifacts.hbsmith.io'
     m.DOCUMENTS_S3_BUCKET = 'hbsmith-tabris-documents'
+    # Fargate 설정 (샌드박스는 항상 Fargate). dispatch 테스트가 쓰는 더미 값.
+    m.WORKSPACE_S3_BUCKET = 'test-workspace'
+    m.ECS_CLUSTER = 'test-cluster'
+    m.ECS_SANDBOX_TASK_DEFINITION = 'test-taskdef'
+    m.ECS_SUBNET_IDS = 'subnet-aaa,subnet-bbb'
+    m.ECS_SECURITY_GROUP_ID = 'sg-test'
+    m.ECS_ASSIGN_PUBLIC_IP = 'ENABLED'
     sys.modules['settings_local'] = m
 
 
@@ -58,7 +63,7 @@ _auth_patch = patch.object(
 _auth_patch.start()
 
 import run_server  # noqa: E402
-from tests.helpers import install_claude_popen_mock  # noqa: E402
+import sandbox_worker  # noqa: E402  (이벤트 JSON 로그는 워커가 남긴다)
 
 
 def _sync_submit(fn, *args, **kwargs):
@@ -72,7 +77,7 @@ def _sync_submit(fn, *args, **kwargs):
 
 @pytest.fixture(autouse=True)
 def _mock_ec2_imds_credentials(monkeypatch):
-    """EC2 IMDS 없이도 Docker 실행 경로가 동작하도록 임시 자격증명을 고정한다."""
+    """EC2 IMDS 없이도 aws CLI 자격증명 경로가 동작하도록 임시 자격증명을 고정한다."""
 
     monkeypatch.setattr(
         run_server,
@@ -94,7 +99,7 @@ def _sync_executor(monkeypatch):
 @pytest.fixture
 def event_log_lines():
     """이벤트 JSON 로그 파일을 비우고, 호출 시 현재까지 기록된 JSON 객체 리스트를 돌려준다."""
-    handler = next((h for h in run_server.event_logger.handlers if hasattr(h, 'flush')), None)
+    handler = next((h for h in sandbox_worker.event_logger.handlers if hasattr(h, 'flush')), None)
 
     def _truncate():
         try:
@@ -130,30 +135,13 @@ def slack_client():
 
 
 @pytest.fixture
-def fake_claude_ok(monkeypatch):
-    """Claude Docker 실행을 성공 응답으로 흉내낸다."""
-
-    def _set(result_text: str = 'Hello from Claude'):
-        # 실제 Claude `--output-format json` 출력을 흉내낸 단일 JSON 객체.
-        envelope = json.dumps(
-            {
-                'type': 'result',
-                'subtype': 'success',
-                'is_error': False,
-                'result': result_text,
-                'total_cost_usd': 0.0123,
-                'usage': {'input_tokens': 100, 'output_tokens': 20},
-                'modelUsage': {
-                    # 메인 모델(비용 큼) + 보조 모델(비용 작음). _primary_model은 메인을 골라야 한다.
-                    'claude-opus-4-8[1m]': {'inputTokens': 100, 'outputTokens': 20, 'costUSD': 0.0123},
-                    'claude-haiku-4-5-20251001': {'inputTokens': 40, 'outputTokens': 30, 'costUSD': 0.0005},
-                },
-            }
-        )
-        install_claude_popen_mock(monkeypatch, stdout_text=envelope, returncode=0)
-        return None
-
-    return _set
+def dispatch_mock(monkeypatch):
+    """봇의 Fargate 디스패치(`_run_claude_fargate`)를 MagicMock으로 대체해 호출 여부/인자만 검사한다."""
+    mock = MagicMock(return_value=('job-1', 'arn:task'))
+    monkeypatch.setattr(run_server, '_run_claude_fargate', mock)
+    # 첨부 S3 업로드도 외부 호출이므로 무력화(파일 없는 이벤트에선 어차피 호출 안 됨).
+    monkeypatch.setattr(run_server, '_upload_slack_files_to_s3', lambda event, thread_ts: [])
+    return mock
 
 
 @pytest.fixture

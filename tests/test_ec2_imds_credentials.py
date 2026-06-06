@@ -117,7 +117,8 @@ def test_fetch_credentials_via_aws_profile_non_zero_exit():
             run_server.fetch_credentials_via_aws_profile('hbsmith-dv')
 
 
-def test_run_claude_falls_back_to_aws_profile_on_imds_failure(monkeypatch):
+def test_resolve_aws_credentials_falls_back_to_profile_on_imds_failure(monkeypatch):
+    """IMDS 실패 시 _resolve_aws_credentials가 aws CLI 프로파일로 폴백한다(boto3 미사용 경로 공용)."""
     import urllib.error
 
     def _imds_fails():
@@ -133,72 +134,19 @@ def test_run_claude_falls_back_to_aws_profile_on_imds_failure(monkeypatch):
             'AWS_SESSION_TOKEN': 'st-fallback',
         },
     )
-    captured: dict = {}
-    from tests.helpers import install_claude_popen_mock
 
-    install_claude_popen_mock(monkeypatch, stdout_text='ok', returncode=0, cmd_capture=captured)
+    creds = run_server._resolve_aws_credentials()
 
-    event = {'channel_type': 'im', 'ts': '2.2', 'thread_ts': '2.2', 'user': 'UFALLBACK'}
-    ok, _text = run_server.run_claude(event, '', 'hello')
-
-    assert ok is True
-    cmd = captured['cmd']
-    env: dict[str, str] = {}
-    i = 0
-    while i < len(cmd):
-        if cmd[i] == '-e' and i + 1 < len(cmd):
-            key, _, val = cmd[i + 1].partition('=')
-            env[key] = val
-            i += 2
-        else:
-            i += 1
-    assert env['AWS_ACCESS_KEY_ID'] == 'AKIAFALLBACK'
-    assert env['AWS_SECRET_ACCESS_KEY'] == 'sk-fallback'
-    assert env['AWS_SESSION_TOKEN'] == 'st-fallback'
+    assert creds['AWS_ACCESS_KEY_ID'] == 'AKIAFALLBACK'
+    assert creds['AWS_SESSION_TOKEN'] == 'st-fallback'
 
 
-def test_run_claude_injects_imds_credentials_into_docker_cmd(monkeypatch):
-    monkeypatch.setattr(
-        run_server,
-        'fetch_ec2_instance_role_credentials',
-        lambda: {
-            'AWS_ACCESS_KEY_ID': 'AKIAINJECT',
-            'AWS_SECRET_ACCESS_KEY': 'sk-inject',
-            'AWS_SESSION_TOKEN': 'st-inject',
-        },
+def test_aws_creds_env_includes_region_and_tokens(monkeypatch):
+    """_aws_creds_env가 자격증명 + 리전을 서브프로세스 env에 싣는다."""
+    env = run_server._aws_creds_env(
+        {'AWS_ACCESS_KEY_ID': 'ak', 'AWS_SECRET_ACCESS_KEY': 'sk', 'AWS_SESSION_TOKEN': 'st'}
     )
-    captured: dict = {}
-    from tests.helpers import install_claude_popen_mock
-
-    install_claude_popen_mock(monkeypatch, stdout_text='ok', returncode=0, cmd_capture=captured)
-
-    event = {'channel_type': 'im', 'ts': '1.1', 'thread_ts': '1.1', 'user': 'UTEST'}
-    run_server.run_claude(event, '', 'hello')
-
-    cmd = captured['cmd']
-    env: dict[str, str] = {}
-    volumes: list[str] = []
-    i = 0
-    while i < len(cmd):
-        if cmd[i] == '-e' and i + 1 < len(cmd):
-            key, _, val = cmd[i + 1].partition('=')
-            env[key] = val
-            i += 2
-        elif cmd[i] == '-v' and i + 1 < len(cmd):
-            volumes.append(cmd[i + 1])
-            i += 2
-        else:
-            i += 1
-    assert env['AWS_ACCESS_KEY_ID'] == 'AKIAINJECT'
-    assert env['AWS_SECRET_ACCESS_KEY'] == 'sk-inject'
-    assert env['AWS_SESSION_TOKEN'] == 'st-inject'
+    assert env['AWS_ACCESS_KEY_ID'] == 'ak'
+    assert env['AWS_SECRET_ACCESS_KEY'] == 'sk'
+    assert env['AWS_SESSION_TOKEN'] == 'st'
     assert env['AWS_DEFAULT_REGION'] == run_server.AWS_DEFAULT_REGION
-
-    # run workspace는 runs/{thread_ts} 경로를 사용한다.
-    assert any(f'{run_server.SANDBOX_RUNS_DIR}/1.1:/workspace:rw' == v for v in volumes)
-    # 사용자별 memory 볼륨이 포함되어 있다.
-    assert any(
-        f'{run_server.SANDBOX_USERS_DIR}/UTEST/{run_server.WORKSPACE_MEMORY_SUBDIR}:{run_server.CLAUDE_MEMORY_CONTAINER_PATH}:rw'
-        == v
-        for v in volumes
-    )
