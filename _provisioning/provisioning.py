@@ -78,6 +78,11 @@ def _preprocess_vagrant():
 
     _print_line_number()
 
+    _run(['mkdir', '-p', '/root/.aws'])
+    _run(['cp', '--backup', '/vagrant/configuration/root/.aws/config', '/root/.aws/config'])
+
+    _print_line_number()
+
     pp = 'etc/systemd/network/20-vagrant-enp0s6.network'
     _run(['cp', '--backup', f'/vagrant/configuration/{pp}', f'/{pp}'])
     _run(['chmod', '644', f'/{pp}'])

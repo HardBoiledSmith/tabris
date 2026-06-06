@@ -21,6 +21,7 @@ export PS1="\u@\h \[\e[32m\]\w \[\e[91m\]\$(parse_git_branch)\[\e[00m\]$ "
 alias rm='rm -i'
 alias cp='cp -i'
 alias mv='mv -i'
+alias awslogin='aws sso login --profile hbsmith-dv --no-browser --use-device-code'
 
 # tabris venv - 프로젝트 디렉토리에서만 활성화
 if [[ "$PWD" == /opt/tabris* ]] && [ -d "/opt/tabris/venv/bin" ]; then
