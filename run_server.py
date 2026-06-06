@@ -77,6 +77,9 @@ CLAUDE_CONTAINER_GID = 1001
 EC2_IMDS_BASE = 'http://169.254.169.254/latest'
 EC2_IMDS_TOKEN_TTL_SECONDS = '21600'
 AWS_DEFAULT_REGION = 'ap-northeast-2'
+# IMDS 조회 실패 시(=로컬/Vagrant 개발환경) 폴백으로 사용할 aws CLI 프로파일.
+# prod EC2에서는 IMDS가 성공하므로 이 경로는 실행되지 않는다.
+AWS_FALLBACK_PROFILE = 'hbsmith-dv'
 
 # 사용자별 Claude memory 호스트 경로. runs/는 스레드별 임시 workspace.
 SANDBOX_ROOT = '/tmp/claude-sandbox'
@@ -750,6 +753,32 @@ def fetch_ec2_instance_role_credentials() -> dict[str, str]:
     }
 
 
+def fetch_credentials_via_aws_profile(profile: str) -> dict[str, str]:
+    """aws CLI 프로파일로 임시 AWS 자격증명을 조회한다(로컬/Vagrant 개발환경 폴백).
+
+    `aws configure export-credentials`는 CLI의 자격증명 resolution(SSO 포함)을 그대로 태운다.
+    SSO 세션이 만료된 경우 `aws sso login --profile <profile>`이 필요하다.
+    """
+    result = subprocess.run(
+        [_aws_cli_executable(), 'configure', 'export-credentials', '--profile', profile, '--format', 'process'],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f'aws export-credentials 실패(profile={profile}). '
+            f'SSO 만료일 수 있음 → `aws sso login --profile {profile}` 확인 필요. {result.stderr.strip()[:300]}'
+        )
+    payload = json.loads(result.stdout)
+    return {
+        'AWS_ACCESS_KEY_ID': payload['AccessKeyId'],
+        'AWS_SECRET_ACCESS_KEY': payload['SecretAccessKey'],
+        'AWS_SESSION_TOKEN': payload['SessionToken'],
+    }
+
+
 def _aws_cli_executable() -> str:
     """호스트에 설치된 aws CLI 경로를 반환한다."""
     path = shutil.which('aws')
@@ -855,8 +884,13 @@ def run_claude(event: dict, context: str, request: str, progress_callback=None) 
         try:
             aws_creds = fetch_ec2_instance_role_credentials()
         except (OSError, urllib.error.HTTPError, urllib.error.URLError, RuntimeError, KeyError) as exc:
-            logger.exception('Failed to fetch EC2 instance role credentials from IMDS')
-            return False, f'⚠️ AWS 자격증명 조회 실패(IMDS): {exc}'
+            # IMDS 실패 = 로컬/Vagrant 개발환경. aws CLI 프로파일로 폴백한다.
+            logger.warning('IMDS 자격증명 실패, 프로파일 폴백 시도(%s): %s', AWS_FALLBACK_PROFILE, exc)
+            try:
+                aws_creds = fetch_credentials_via_aws_profile(AWS_FALLBACK_PROFILE)
+            except (subprocess.SubprocessError, OSError, RuntimeError, KeyError, ValueError) as fb_exc:
+                logger.exception('Failed to fetch AWS credentials from both IMDS and aws profile')
+                return False, f'⚠️ AWS 자격증명 조회 실패(IMDS·프로파일 모두): {fb_exc}'
 
         with _user_memory_lock(slack_user_id):
             try:

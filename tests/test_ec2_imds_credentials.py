@@ -1,6 +1,7 @@
 """EC2 IMDSv2 임시 자격증명 조회 단위 테스트."""
 
 import json
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -82,6 +83,78 @@ def test_fetch_ec2_instance_role_credentials_non_success_code():
     with patch('run_server.urllib.request.urlopen', side_effect=fake_urlopen):
         with pytest.raises(RuntimeError, match='Code'):
             run_server.fetch_ec2_instance_role_credentials()
+
+
+def test_fetch_credentials_via_aws_profile_success():
+    export_payload = {
+        'Version': 1,
+        'AccessKeyId': 'AKIAPROFILE',
+        'SecretAccessKey': 'profile-secret',
+        'SessionToken': 'profile-session-token',
+        'Expiration': '2026-01-01T00:00:00Z',
+    }
+    completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(export_payload), stderr='')
+
+    with patch('run_server.subprocess.run', return_value=completed) as mock_run:
+        got = run_server.fetch_credentials_via_aws_profile('hbsmith-dv')
+
+    assert got == {
+        'AWS_ACCESS_KEY_ID': 'AKIAPROFILE',
+        'AWS_SECRET_ACCESS_KEY': 'profile-secret',
+        'AWS_SESSION_TOKEN': 'profile-session-token',
+    }
+    cmd = mock_run.call_args.args[0]
+    assert cmd[1:] == ['configure', 'export-credentials', '--profile', 'hbsmith-dv', '--format', 'process']
+
+
+def test_fetch_credentials_via_aws_profile_non_zero_exit():
+    completed = subprocess.CompletedProcess(
+        args=[], returncode=255, stdout='', stderr='Error loading SSO Token: Token has expired'
+    )
+
+    with patch('run_server.subprocess.run', return_value=completed):
+        with pytest.raises(RuntimeError, match='aws sso login'):
+            run_server.fetch_credentials_via_aws_profile('hbsmith-dv')
+
+
+def test_run_claude_falls_back_to_aws_profile_on_imds_failure(monkeypatch):
+    import urllib.error
+
+    def _imds_fails():
+        raise urllib.error.URLError('IMDS unreachable')
+
+    monkeypatch.setattr(run_server, 'fetch_ec2_instance_role_credentials', _imds_fails)
+    monkeypatch.setattr(
+        run_server,
+        'fetch_credentials_via_aws_profile',
+        lambda profile: {
+            'AWS_ACCESS_KEY_ID': 'AKIAFALLBACK',
+            'AWS_SECRET_ACCESS_KEY': 'sk-fallback',
+            'AWS_SESSION_TOKEN': 'st-fallback',
+        },
+    )
+    captured: dict = {}
+    from tests.helpers import install_claude_popen_mock
+
+    install_claude_popen_mock(monkeypatch, stdout_text='ok', returncode=0, cmd_capture=captured)
+
+    event = {'channel_type': 'im', 'ts': '2.2', 'thread_ts': '2.2', 'user': 'UFALLBACK'}
+    ok, _text = run_server.run_claude(event, '', 'hello')
+
+    assert ok is True
+    cmd = captured['cmd']
+    env: dict[str, str] = {}
+    i = 0
+    while i < len(cmd):
+        if cmd[i] == '-e' and i + 1 < len(cmd):
+            key, _, val = cmd[i + 1].partition('=')
+            env[key] = val
+            i += 2
+        else:
+            i += 1
+    assert env['AWS_ACCESS_KEY_ID'] == 'AKIAFALLBACK'
+    assert env['AWS_SECRET_ACCESS_KEY'] == 'sk-fallback'
+    assert env['AWS_SESSION_TOKEN'] == 'st-fallback'
 
 
 def test_run_claude_injects_imds_credentials_into_docker_cmd(monkeypatch):
