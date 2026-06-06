@@ -32,12 +32,12 @@ from settings_local import ARTIFACTS_S3_BUCKET
 from settings_local import BOT_USER_ID
 from settings_local import CLAUDE_TIMEOUT
 from settings_local import DOCKER_IMAGE
+from settings_local import DOCUMENTS_S3_BUCKET
 from settings_local import GITHUB_PAT
 from settings_local import JIRA_API_KEY
 from settings_local import JIRA_API_USERNAME
 from settings_local import MAX_WORKERS
 from settings_local import MEMORY_S3_BUCKET
-from settings_local import MEMORY_S3_SYNC_ENABLED
 from settings_local import MEMORY_S3_SYNC_TIMEOUT
 from settings_local import NERV_MCP_TOKEN
 from settings_local import SENTRY_AUTH_TOKEN
@@ -812,8 +812,8 @@ def _aws_s3_sync(src: str, dst: str, creds: dict, *, delete: bool = False) -> No
 
 
 def sync_memory_from_s3(user_id: str, memory_dir: str, creds: dict) -> None:
-    """S3 → 로컬 memory 디렉터리로 동기화한다. MEMORY_S3_SYNC_ENABLED=False면 no-op."""
-    if not MEMORY_S3_SYNC_ENABLED:
+    """S3 → 로컬 memory 디렉터리로 동기화한다. MEMORY_S3_BUCKET 미설정이면 no-op."""
+    if not MEMORY_S3_BUCKET:
         return
     s3_uri = f's3://{MEMORY_S3_BUCKET}/users/{user_id}/'
     logger.info('Syncing memory from S3: %s -> %s', s3_uri, memory_dir)
@@ -821,8 +821,8 @@ def sync_memory_from_s3(user_id: str, memory_dir: str, creds: dict) -> None:
 
 
 def sync_memory_to_s3(user_id: str, memory_dir: str, creds: dict) -> None:
-    """로컬 memory → S3 미러 동기화. 로컬에 없는 S3 객체는 --delete로 제거한다."""
-    if not MEMORY_S3_SYNC_ENABLED:
+    """로컬 memory → S3 미러 동기화. MEMORY_S3_BUCKET 미설정이면 no-op. 로컬에 없는 S3 객체는 --delete로 제거한다."""
+    if not MEMORY_S3_BUCKET:
         return
     if not _memory_dir_has_files(memory_dir):
         logger.warning('Skipping memory upload: empty memory_dir for user %s', user_id)
@@ -974,6 +974,10 @@ def _run_claude_docker(
         f'ARTIFACTS_S3_BUCKET={ARTIFACTS_S3_BUCKET}',
         '-e',
         f'ARTIFACTS_BASE_URL={ARTIFACTS_BASE_URL}',
+        '-e',
+        f'DOCUMENTS_S3_BUCKET={DOCUMENTS_S3_BUCKET}',
+        '-e',
+        f'MEMORY_S3_BUCKET={MEMORY_S3_BUCKET}',
         '--workdir',
         '/workspace',
         DOCKER_IMAGE,

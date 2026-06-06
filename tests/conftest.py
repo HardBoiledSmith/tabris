@@ -26,11 +26,11 @@ def _install_settings_local_stub() -> None:
     m.SENTRY_AUTH_TOKEN = 'sntrys_test'
     m.SLACK_APP_TOKEN = 'xapp-test'
     m.SLACK_BOT_TOKEN = 'xoxb-test'
-    m.MEMORY_S3_BUCKET = 'hbsmith-tabris-memory'
-    m.MEMORY_S3_SYNC_ENABLED = False
+    m.MEMORY_S3_BUCKET = ''  # 빈 값 = memory S3 동기화 비활성 (테스트 기본)
     m.MEMORY_S3_SYNC_TIMEOUT = 60
     m.ARTIFACTS_S3_BUCKET = 'hbsmith-tabris-artifacts'
     m.ARTIFACTS_BASE_URL = 'https://tabris-artifacts.hbsmith.io'
+    m.DOCUMENTS_S3_BUCKET = 'hbsmith-tabris-documents'
     sys.modules['settings_local'] = m
 
 
