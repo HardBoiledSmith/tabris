@@ -105,8 +105,8 @@ def test_on_dm_unknown_subtype_skips(monkeypatch):
 
 def test_handle_request_file_only_dispatches_with_input_note(monkeypatch, slack_client):
     """텍스트 없이 첨부만 있는 메시지도 디스패치되며, 프롬프트에 input 안내가 들어간다."""
-    dispatch = MagicMock(return_value=('job', 'arn'))
-    monkeypatch.setattr(run_server, '_run_claude_fargate', dispatch)
+    dispatch = MagicMock(return_value='job')
+    monkeypatch.setattr(run_server, '_enqueue_claude_job', dispatch)
     monkeypatch.setattr(
         run_server,
         '_upload_slack_files_to_s3',

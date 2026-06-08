@@ -114,18 +114,17 @@ def test_download_inputs_from_s3(monkeypatch, tmp_path):
 
 def test_process_job_emits_request_and_response_events(monkeypatch, event_log_lines):
     """워커가 토큰/비용 집계용 request·response JSON 이벤트를 남긴다(봇이 아닌 워커 책임)."""
-    for k, v in {
-        'TABRIS_JOB_ID': 'job-1',
-        'TABRIS_SLACK_CHANNEL': 'D1',
-        'TABRIS_SLACK_THREAD_TS': '1700000000.000001',
-        'TABRIS_SLACK_WAITING_MSG_TS': '1700000000.000100',
-        'TABRIS_SLACK_USER_ID': 'U1',
-        'TABRIS_PROMPT_S3_KEY': 'runs/x/prompt.txt',
-        'TABRIS_INPUT_FILES_JSON': '[]',
-        'SLACK_BOT_TOKEN': 'xoxb-test',
-        'TABRIS_REQUEST_EPOCH': '1700000000.0',
-    }.items():
-        monkeypatch.setenv(k, v)
+    monkeypatch.setenv('SLACK_BOT_TOKEN', 'xoxb-test')
+    job = {
+        'job_id': 'job-1',
+        'channel': 'D1',
+        'thread_ts': '1700000000.000001',
+        'waiting_msg_ts': '1700000000.000100',
+        'user_id': 'U1',
+        'prompt_s3_key': 'runs/x/prompt.txt',
+        'input_files': [],
+        'request_epoch': 1700000000.0,
+    }
 
     monkeypatch.setattr(sandbox_worker, 'WebClient', lambda token: MagicMock())
     monkeypatch.setattr(sandbox_worker.os, 'makedirs', lambda *a, **k: None)
@@ -146,7 +145,7 @@ def test_process_job_emits_request_and_response_events(monkeypatch, event_log_li
         ),
     )
 
-    sandbox_worker.process_job()
+    sandbox_worker.process_job(job)
 
     by_evt = {e['evt']: e for e in event_log_lines()}
     assert 'request' in by_evt and 'response' in by_evt

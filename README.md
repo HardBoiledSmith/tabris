@@ -188,7 +188,9 @@ vagrant destroy -f     # VM 완전 삭제
 
 VM에서는 `/etc/tabris/settings_local.py`에 Python 상수로 정의한다. 샘플은 `_provisioning/configuration/etc/tabris/settings_local_sample.py` 참고. 로컬 개발 시에도 동일하게 `settings_local`를 import할 수 있는 경로에 두면 된다.
 
-> 워커(샌드박스) 쪽 튜닝값 `MAX_JOBS`(기본 2)·`MAX_LIFETIME_SEC`(2700)·`SQS_VISIBILITY_TIMEOUT_SEC`(360)와 시크릿은 **Fargate 태스크 정의의 env**로 주입된다(`_provisioning/fargate/task_definition_sandbox.json`, `run_create_poc.sh`가 치환). 워밍 풀 워커는 RunTask override가 없어 task def env가 정본이다.
+> 워커(샌드박스) 쪽 튜닝값 `MAX_JOBS`(기본 2)·`MAX_LIFETIME_SEC`(2700)·`SQS_VISIBILITY_TIMEOUT_SEC`(360)는 **Fargate 태스크 정의의 env**로 주입된다(`_provisioning/fargate/task_definition_sandbox.json`, `run_create_poc.sh`가 치환).
+>
+> 시크릿(`ANTHROPIC_API_KEY`·`SLACK_BOT_TOKEN`·`NERV_MCP_TOKEN`·`ATLASSIAN_ROVO_MCP_TOKEN`·`GITHUB_PAT`·`SENTRY_AUTH_TOKEN`)은 평문 env가 아니라 **SSM Parameter Store(SecureString, `/tabris/sandbox/*`)**에 저장하고, 태스크 정의의 `secrets` 블록이 `valueFrom`으로 참조한다. `run_create_poc.sh`가 `settings_local.py`에서 읽어 SSM에 적재하고 execution role에 읽기 권한을 부여하므로, 콘솔/`describe-task-definition`/RunTask 호출 어디에도 평문이 노출되지 않는다. 키 회전 시 SSM 값만 갱신 후 새 태스크가 뜨면 반영된다.
 
 ## 인프라 선행 조건 (운영 배포 시 필수)
 

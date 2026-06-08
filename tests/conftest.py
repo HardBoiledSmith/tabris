@@ -43,11 +43,8 @@ def _install_settings_local_stub() -> None:
     m.DOCUMENTS_S3_BUCKET = 'hbsmith-tabris-documents'
     # Fargate 설정 (샌드박스는 항상 Fargate). dispatch 테스트가 쓰는 더미 값.
     m.WORKSPACE_S3_BUCKET = 'test-workspace'
-    m.ECS_CLUSTER = 'test-cluster'
-    m.ECS_SANDBOX_TASK_DEFINITION = 'test-taskdef'
-    m.ECS_SUBNET_IDS = 'subnet-aaa,subnet-bbb'
-    m.ECS_SECURITY_GROUP_ID = 'sg-test'
-    m.ECS_ASSIGN_PUBLIC_IP = 'ENABLED'
+    m.ECS_CLUSTER = 'test-cluster'  # 취소(StopTask)에 사용
+    m.SQS_QUEUE_URL = 'https://sqs.test/000000000000/tabris-sandbox-jobs.fifo'
     sys.modules['settings_local'] = m
 
 
@@ -136,9 +133,9 @@ def slack_client():
 
 @pytest.fixture
 def dispatch_mock(monkeypatch):
-    """봇의 Fargate 디스패치(`_run_claude_fargate`)를 MagicMock으로 대체해 호출 여부/인자만 검사한다."""
-    mock = MagicMock(return_value=('job-1', 'arn:task'))
-    monkeypatch.setattr(run_server, '_run_claude_fargate', mock)
+    """봇의 SQS 디스패치(`_enqueue_claude_job`)를 MagicMock으로 대체해 호출 여부/인자만 검사한다."""
+    mock = MagicMock(return_value='job-1')
+    monkeypatch.setattr(run_server, '_enqueue_claude_job', mock)
     # 첨부 S3 업로드도 외부 호출이므로 무력화(파일 없는 이벤트에선 어차피 호출 안 됨).
     monkeypatch.setattr(run_server, '_upload_slack_files_to_s3', lambda event, thread_ts: [])
     return mock

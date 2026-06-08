@@ -57,8 +57,8 @@ mapping = {
     'CFG_ARTIFACTS_BASE_URL': 'ARTIFACTS_BASE_URL',
     'CFG_CLUSTER':            'ECS_CLUSTER',
     'CFG_TASK_FAMILY':        'ECS_SANDBOX_TASK_DEFINITION',
-    # 워밍 풀 워커는 RunTask override가 없으므로 시크릿을 task def env로 상주시켜야 한다.
-    # (보안 수준은 기존 RunTask override 평문 주입과 동일.)
+    # 시크릿은 SSM Parameter Store(SecureString)에 적재하고 task def secrets 블록이 참조한다.
+    # 워커는 평소처럼 env로 받으므로(ECS가 시작 시 주입) 코드는 그대로다.
     'CFG_ANTHROPIC_API_KEY':  'ANTHROPIC_API_KEY',
     'CFG_SLACK_BOT_TOKEN':    'SLACK_BOT_TOKEN',
     'CFG_NERV_MCP_TOKEN':     'NERV_MCP_TOKEN',
@@ -79,6 +79,9 @@ TASK_ROLE_NAME='tabris-sandbox-task-role'
 EXEC_ROLE_NAME='tabris-ecs-execution-role'
 LOG_GROUP='/ecs/tabris-sandbox'
 SG_NAME='tabris-sandbox-sg'
+# 시크릿은 평문 env 대신 SSM Parameter Store(SecureString)에 두고, task def의 secrets 블록이
+# valueFrom으로 참조한다(콘솔/RunTask 호출에 평문 미노출). 파라미터 이름 접두사.
+SSM_PREFIX='/tabris/sandbox/'
 
 # 워밍 풀 리소스(이름 고정) / 튜닝값(env로 override 가능).
 QUEUE_NAME="${QUEUE_NAME:-tabris-sandbox-jobs.fifo}"
@@ -102,7 +105,7 @@ ARTIFACTS_BASE_URL="${CFG_ARTIFACTS_BASE_URL:?settings_local.py에 ARTIFACTS_BAS
 CLUSTER="${CFG_CLUSTER:?settings_local.py에 ECS_CLUSTER가 없습니다}"
 TASK_FAMILY="${CFG_TASK_FAMILY:?settings_local.py에 ECS_SANDBOX_TASK_DEFINITION가 없습니다}"
 
-# 워밍 풀 워커는 task def env로 시크릿을 받는다(RunTask override 없음). settings_local에서만 읽는다.
+# 시크릿은 settings_local에서 읽어 SSM에 적재한다(아래 6.7). task def는 SSM을 valueFrom으로 참조.
 ANTHROPIC_API_KEY="${CFG_ANTHROPIC_API_KEY:?settings_local.py에 ANTHROPIC_API_KEY가 없습니다}"
 SLACK_BOT_TOKEN="${CFG_SLACK_BOT_TOKEN:?settings_local.py에 SLACK_BOT_TOKEN가 없습니다}"
 NERV_MCP_TOKEN="${CFG_NERV_MCP_TOKEN:?settings_local.py에 NERV_MCP_TOKEN가 없습니다}"
@@ -193,6 +196,31 @@ aws iam get-role --role-name "${EXEC_ROLE_NAME}" >/dev/null 2>&1 \
        --assume-role-policy-document "${ECS_TRUST}" >/dev/null
 aws iam attach-role-policy --role-name "${EXEC_ROLE_NAME}" \
   --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+# task def secrets(valueFrom)를 ECS 에이전트가 해석하려면 execution role에 SSM 읽기 권한이 필요.
+# SecureString 복호화는 SSM 경유(kms:ViaService) kms:Decrypt로 한정한다(기본 키 alias/aws/ssm 대응).
+EXEC_SSM_POLICY="$(cat <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadSandboxSecrets",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameters"],
+      "Resource": "arn:aws:ssm:${AWS_REGION}:${ACCOUNT_ID}:parameter${SSM_PREFIX}*"
+    },
+    {
+      "Sid": "DecryptSandboxSecrets",
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt"],
+      "Resource": "*",
+      "Condition": {"StringEquals": {"kms:ViaService": "ssm.${AWS_REGION}.amazonaws.com"}}
+    }
+  ]
+}
+JSON
+)"
+aws iam put-role-policy --role-name "${EXEC_ROLE_NAME}" \
+  --policy-name tabris-sandbox-ssm --policy-document "${EXEC_SSM_POLICY}"
 
 log "IAM task role: ${TASK_ROLE_NAME}"
 echo "  grant 대상 버킷 (settings_local.py 와 일치해야 함):"
@@ -326,16 +354,32 @@ JSON
 echo "QUEUE=${QUEUE_URL}"
 
 # ---------------------------------------------------------------------------
+# 6.7 SSM Parameter Store — 시크릿 적재(SecureString). task def secrets가 이 값을 참조한다.
+# ---------------------------------------------------------------------------
+log "SSM Parameter Store에 시크릿 적재: ${SSM_PREFIX}*"
+_put_secret() {  # $1=파라미터 이름, $2=값
+  aws ssm put-parameter --type SecureString --overwrite \
+    --name "${SSM_PREFIX}$1" --value "$2" >/dev/null
+  echo "  ✓ ${SSM_PREFIX}$1"
+}
+_put_secret ANTHROPIC_API_KEY        "${ANTHROPIC_API_KEY}"
+_put_secret SLACK_BOT_TOKEN          "${SLACK_BOT_TOKEN}"
+_put_secret NERV_MCP_TOKEN           "${NERV_MCP_TOKEN}"
+_put_secret ATLASSIAN_ROVO_MCP_TOKEN "${ATLASSIAN_ROVO_MCP_TOKEN}"
+_put_secret GITHUB_PAT               "${GITHUB_PAT}"
+_put_secret SENTRY_AUTH_TOKEN        "${SENTRY_AUTH_TOKEN}"
+
+# ---------------------------------------------------------------------------
 # 7. Task Definition 등록 (ARM64)
 # ---------------------------------------------------------------------------
 log "Task Definition 렌더 & 등록: ${TASK_FAMILY}"
 RENDERED="$(mktemp)"
+# 시크릿은 더 이상 템플릿에 치환하지 않는다(SSM 참조). secrets ARN 조립용으로 SSM_PREFIX만 추가.
 export TASK_FAMILY ACCOUNT_ID TASK_ROLE_NAME EXEC_ROLE_NAME REGISTRY IMAGE_TAG \
        AWS_REGION WORKSPACE_BUCKET MEMORY_BUCKET ARTIFACTS_BUCKET ARTIFACTS_BASE_URL \
        DOCUMENTS_BUCKET LOG_GROUP \
        QUEUE_URL MAX_JOBS MAX_LIFETIME_SEC SQS_VISIBILITY_TIMEOUT_SEC \
-       ANTHROPIC_API_KEY SLACK_BOT_TOKEN NERV_MCP_TOKEN ATLASSIAN_ROVO_MCP_TOKEN \
-       GITHUB_PAT SENTRY_AUTH_TOKEN
+       SSM_PREFIX
 python3 - "${TEMPLATE}" > "${RENDERED}" <<'PY'
 import os, sys, string
 tpl = string.Template(open(sys.argv[1]).read())
@@ -483,13 +527,9 @@ cat <<SNIPPET
 settings_local.py 에 아래를 반영하고 봇을 재시작하세요 (Vagrant):
 
 WORKSPACE_S3_BUCKET = '${WORKSPACE_BUCKET}'
-ECS_CLUSTER = '${CLUSTER}'
-ECS_SANDBOX_TASK_DEFINITION = '${TASK_FAMILY}'
-ECS_SUBNET_IDS = '${SUBNET_IDS}'
-ECS_SECURITY_GROUP_ID = '${SG_ID}'
-ECS_ASSIGN_PUBLIC_IP = 'ENABLED'
+ECS_CLUSTER = '${CLUSTER}'      # 취소(StopTask)에 사용
 
-# 워밍 풀로 전환하려면 아래를 설정(빈 값이면 위 ECS_* 기반 1회용 RunTask 경로로 동작):
+# 워밍 풀 디스패치 큐. 필수 — 비어 있으면 봇이 기동을 거부한다.
 SQS_QUEUE_URL = '${QUEUE_URL}'
 
 ※ 봇은 aws CLI만 사용하므로 추가 pip 설치가 필요 없습니다.

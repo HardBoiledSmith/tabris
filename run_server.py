@@ -1,4 +1,3 @@
-import base64
 import json
 import logging
 import os
@@ -19,48 +18,18 @@ from tabris_slack_utils import ARTIFACT_MAX_BYTES_PER_FILE
 from tabris_slack_utils import ARTIFACT_MAX_FILES
 from tabris_slack_utils import ARTIFACT_MAX_TOTAL_BYTES
 from tabris_slack_utils import WORKSPACE_INPUT_SUBDIR
-from tabris_slack_utils import _build_cancel_blocks
 from tabris_slack_utils import _sanitize_slack_attachment_filename
 from tabris_slack_utils import decode_cancel_value
-from tabris_slack_utils import encode_cancel_value
 
 sys.path.append('/etc/tabris')
 from settings_local import ALLOWED_TEAM_IDS
 from settings_local import ALLOWED_USER_IDS
-from settings_local import ANTHROPIC_API_KEY
-from settings_local import ARTIFACTS_BASE_URL
-from settings_local import ARTIFACTS_S3_BUCKET
 from settings_local import BOT_USER_ID
-from settings_local import CLAUDE_TIMEOUT
-from settings_local import DOCUMENTS_S3_BUCKET
-from settings_local import ECS_ASSIGN_PUBLIC_IP
 from settings_local import ECS_CLUSTER
-from settings_local import ECS_SANDBOX_TASK_DEFINITION
-from settings_local import ECS_SECURITY_GROUP_ID
-from settings_local import ECS_SUBNET_IDS
-from settings_local import GITHUB_PAT
-from settings_local import JIRA_API_KEY
-from settings_local import JIRA_API_USERNAME
 from settings_local import MAX_WORKERS
-from settings_local import MEMORY_S3_BUCKET
-from settings_local import NERV_MCP_TOKEN
-from settings_local import SENTRY_AUTH_TOKEN
 from settings_local import SLACK_APP_TOKEN
 from settings_local import SLACK_BOT_TOKEN
 from settings_local import WORKSPACE_S3_BUCKET
-
-
-def _as_subnet_list(raw) -> list[str]:
-    """ECS_SUBNET_IDS를 list[str]로 정규화한다(CSV 문자열/list 모두 허용)."""
-    if isinstance(raw, (list, tuple)):
-        items = list(raw)
-    else:
-        items = str(raw or '').split(',')
-    return [s.strip() for s in items if s and s.strip()]
-
-
-# Atlassian MCP Basic auth: echo -n "user:api_key" | base64
-ATLASSIAN_ROVO_MCP_TOKEN = base64.b64encode(f'{JIRA_API_USERNAME}:{JIRA_API_KEY}'.encode()).decode('ascii')
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -157,12 +126,14 @@ try:
 except ImportError:
     ALLOWED_ALL_USER_TEAM_IDS = ''
 
-# 워밍 풀 디스패치 큐. 설정돼 있으면 봇은 RunTask(콜드) 대신 이 SQS FIFO 큐로 잡을 적재하고,
-# 상주 워커 풀이 소비한다. 빈 문자열이면 레거시 1회용 RunTask 경로로 동작한다(롤백 안전망).
+# 워밍 풀 디스패치 큐. 봇은 이 SQS FIFO 큐로 잡을 적재하고, 상주 워커 풀이 소비한다.
+# 필수 설정 — 누락되거나 비어 있으면 기동을 거부한다.
 try:
     from settings_local import SQS_QUEUE_URL
-except ImportError:
-    SQS_QUEUE_URL = ''
+except ImportError as exc:
+    raise RuntimeError('SQS_QUEUE_URL must be set in settings_local') from exc
+if not SQS_QUEUE_URL:
+    raise RuntimeError('SQS_QUEUE_URL must be set in settings_local')
 
 
 _ALLOWED_TEAM_IDS = _parse_ids(ALLOWED_TEAM_IDS)
@@ -325,26 +296,6 @@ def _s3_put_bytes(bucket: str, key: str, body: bytes, creds: dict) -> None:
         raise RuntimeError(f's3 cp 실패(s3://{bucket}/{key}): {result.stderr.decode("utf-8", "replace")[:300]}')
 
 
-def _ecs_run_task(network_config: dict, overrides: dict, creds: dict) -> dict:
-    """aws CLI로 ECS RunTask를 호출하고 응답 JSON을 반환한다(boto3 미사용)."""
-    cmd = [
-        _aws_cli_executable(), 'ecs', 'run-task',
-        '--cluster', ECS_CLUSTER,
-        '--task-definition', ECS_SANDBOX_TASK_DEFINITION,
-        '--launch-type', 'FARGATE',
-        '--count', '1',
-        '--network-configuration', json.dumps(network_config),
-        '--overrides', json.dumps(overrides),
-        '--output', 'json',
-    ]
-    result = subprocess.run(
-        cmd, env=_aws_creds_env(creds), capture_output=True, text=True, timeout=60, check=False
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f'ecs run-task 실패: {result.stderr[:300]}')
-    return json.loads(result.stdout or '{}')
-
-
 def _ecs_stop_task(task_arn: str, reason: str, creds: dict) -> bool:
     """aws CLI로 ECS StopTask를 호출한다(취소). 성공 여부를 반환한다."""
     cmd = [
@@ -438,80 +389,6 @@ def _upload_slack_files_to_s3(event: dict, thread_ts: str) -> list[dict]:
         uploaded.append({'filename': candidate, 's3_key': s3_key})
 
     return uploaded
-
-
-def _run_claude_fargate(
-    event: dict, prompt: str, thread_ts: str, waiting_msg_ts: str, slack_input_files: list[dict], received_at: float
-):
-    """ECS Fargate에 sandbox 태스크를 RunTask로 띄운다(fire & forget).
-
-    시크릿/설정은 env override로 직접 주입한다(Secrets Manager 미사용). 이후 모든 Slack
-    업데이트·결과 게시는 샌드박스 태스크(sandbox_worker.py)가 담당한다.
-    """
-    msg_id = event.get('client_msg_id') or event.get('ts')
-    job_id = _fargate_job_id(thread_ts, msg_id)
-    slack_user_id = event.get('user') or event.get('bot_id') or ''
-    is_dm = _is_dm_channel(event)
-    channel = event['channel']
-
-    subnets = _as_subnet_list(ECS_SUBNET_IDS)
-    if not subnets or not ECS_SECURITY_GROUP_ID:
-        raise RuntimeError(
-            'Fargate 네트워크 설정 누락: ECS_SUBNET_IDS / ECS_SECURITY_GROUP_ID를 settings_local.py에 설정하세요.'
-        )
-
-    # 1. prompt를 S3에 저장 (env override 크기 한도를 피하려고 본문은 S3 경유)
-    creds = _resolve_aws_credentials()
-    prompt_key = f'runs/{thread_ts}/prompt.txt'
-    _s3_put_bytes(WORKSPACE_S3_BUCKET, prompt_key, prompt.encode('utf-8'), creds)
-
-    # 2. ECS RunTask — job 파라미터 + 시크릿/설정을 env override로 주입
-    env_override = [
-        # 풀 task def엔 TABRIS_QUEUE_URL이 박혀 있다. RunTask(1회용)는 빈 값으로 덮어
-        # 워커가 루프 대신 process_job 1회만 돌게 강제한다(레거시/롤백 경로).
-        {'name': 'TABRIS_QUEUE_URL', 'value': ''},
-        {'name': 'TABRIS_JOB_ID', 'value': job_id},
-        {'name': 'TABRIS_SLACK_CHANNEL', 'value': channel},
-        {'name': 'TABRIS_SLACK_THREAD_TS', 'value': thread_ts},
-        {'name': 'TABRIS_SLACK_WAITING_MSG_TS', 'value': waiting_msg_ts},
-        {'name': 'TABRIS_SLACK_USER_ID', 'value': slack_user_id},
-        {'name': 'TABRIS_SLACK_IS_DM', 'value': str(is_dm).lower()},
-        {'name': 'TABRIS_PROMPT_S3_KEY', 'value': prompt_key},
-        {'name': 'TABRIS_INPUT_FILES_JSON', 'value': json.dumps(slack_input_files)},
-        # 봇이 메시지를 받은 시점(epoch). 샌드박스는 이 값 기준으로 총 실행 시간을 계산한다.
-        {'name': 'TABRIS_REQUEST_EPOCH', 'value': f'{received_at:.3f}'},
-        # 시크릿/토큰 (RunTask env override 직접 주입)
-        {'name': 'ANTHROPIC_API_KEY', 'value': ANTHROPIC_API_KEY},
-        {'name': 'SLACK_BOT_TOKEN', 'value': SLACK_BOT_TOKEN},
-        {'name': 'NERV_MCP_TOKEN', 'value': NERV_MCP_TOKEN},
-        {'name': 'ATLASSIAN_ROVO_MCP_TOKEN', 'value': ATLASSIAN_ROVO_MCP_TOKEN},
-        {'name': 'GITHUB_PAT', 'value': GITHUB_PAT},
-        {'name': 'SENTRY_AUTH_TOKEN', 'value': SENTRY_AUTH_TOKEN},
-        {'name': 'SLACK_USER_ID', 'value': slack_user_id},
-        # 버킷/설정 (task def에도 있으나 봇 설정과 일치시키려 override로 한 번 더 명시)
-        {'name': 'WORKSPACE_S3_BUCKET', 'value': WORKSPACE_S3_BUCKET},
-        {'name': 'MEMORY_S3_BUCKET', 'value': MEMORY_S3_BUCKET},
-        {'name': 'ARTIFACTS_S3_BUCKET', 'value': ARTIFACTS_S3_BUCKET},
-        {'name': 'ARTIFACTS_BASE_URL', 'value': ARTIFACTS_BASE_URL},
-        {'name': 'DOCUMENTS_S3_BUCKET', 'value': DOCUMENTS_S3_BUCKET},
-        {'name': 'CLAUDE_TIMEOUT', 'value': str(CLAUDE_TIMEOUT)},
-    ]
-
-    network_config = {
-        'awsvpcConfiguration': {
-            'subnets': subnets,
-            'securityGroups': [ECS_SECURITY_GROUP_ID],
-            'assignPublicIp': ECS_ASSIGN_PUBLIC_IP,
-        }
-    }
-    overrides = {'containerOverrides': [{'name': 'tabris-sandbox', 'environment': env_override}]}
-    resp = _ecs_run_task(network_config, overrides, creds)
-    failures = resp.get('failures') or []
-    if failures:
-        raise RuntimeError(f'ECS RunTask 실패: {failures}')
-    task_arn = (resp.get('tasks') or [{}])[0].get('taskArn')
-    logger.info('[FARGATE] RunTask job_id=%s task=%s', job_id, task_arn)
-    return job_id, task_arn
 
 
 def _enqueue_claude_job(
@@ -698,7 +575,7 @@ def _handle_request_pool(event, client, channel, thread_ts, is_dm, user_request,
     봇은 어느 워커가 잡을 집을지 모르므로(=task ARN 미정) 여기서 취소 버튼을 달지 않는다.
     워커가 잡을 집는 즉시 자기 task ARN + job_id로 버튼을 부착한다.
     """
-    initial_text = '⏳ 접수됨 — 샌드박스를 시작하고 있습니다…'
+    initial_text = '⏳ 접수됨 — 작업 처리 대기중입니다…'
     waiting_msg = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=initial_text)
     try:
         prompt, slack_input_files = _prepare_prompt(client, event, channel, thread_ts, is_dm, user_request)
@@ -707,54 +584,10 @@ def _handle_request_pool(event, client, channel, thread_ts, is_dm, user_request,
         logger.exception('Failed to enqueue job to SQS')
         try:
             client.chat_update(
-                channel=channel, ts=waiting_msg['ts'], text=f'⚠️ 샌드박스 접수 실패: {exc}', blocks=[]
+                channel=channel, ts=waiting_msg['ts'], text=f'⚠️ 작업 접수 실패: {exc}', blocks=[]
             )
         except Exception:
             logger.warning('Failed to update waiting message after enqueue error', exc_info=True)
-
-
-def _handle_request_fargate(event, client, channel, thread_ts, is_dm, user_request, received_at):
-    """레거시 1회용 모드: ① 즉시 접수 메시지(버튼 없음) → ② S3 업로드·RunTask → ③ ARN 취소 버튼 부착.
-
-    취소 버튼 value에는 task ARN + job_id를 담아, 클릭 시 cancel 마커 후 ecs StopTask로 종료한다.
-    태스크가 생기기 전(①~②)에는 취소할 대상이 없으므로 버튼을 달지 않는다.
-    received_at: 봇이 메시지를 받은 시점(epoch). 샌드박스가 실행 시간 표시에 사용한다.
-    """
-    # ① 즉시 접수 메시지(버튼 없음) — cold start를 가리는 즉시 ACK.
-    initial_text = '⏳ 접수됨 — 샌드박스를 시작하고 있습니다…'
-    waiting_msg = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=initial_text)
-
-    try:
-        prompt, slack_input_files = _prepare_prompt(client, event, channel, thread_ts, is_dm, user_request)
-        # ② RunTask → task ARN 획득
-        job_id, task_arn = _run_claude_fargate(
-            event, prompt, thread_ts, waiting_msg['ts'], slack_input_files, received_at
-        )
-    except Exception as exc:
-        logger.exception('Failed to dispatch Fargate task')
-        try:
-            client.chat_update(
-                channel=channel,
-                ts=waiting_msg['ts'],
-                text=f'⚠️ 샌드박스 시작 실패: {exc}',
-                blocks=[],
-            )
-        except Exception:
-            logger.warning('Failed to update waiting message after dispatch error', exc_info=True)
-        return
-
-    # ③ ARN+job_id를 담은 취소 버튼 부착. 이후 진행률 업데이트 시 워커가 같은 value로 버튼을 유지한다.
-    if task_arn:
-        try:
-            cancel_value = encode_cancel_value(task_arn, job_id)
-            client.chat_update(
-                channel=channel,
-                ts=waiting_msg['ts'],
-                text=initial_text,
-                blocks=_build_cancel_blocks(initial_text, cancel_value),
-            )
-        except Exception:
-            logger.warning('Failed to attach cancel button after dispatch', exc_info=True)
 
 
 def handle_request(event: dict, client):
@@ -801,10 +634,7 @@ def handle_request(event: dict, client):
         _post_access_denied(client, channel, thread_ts, USER_ACCESS_DENIED_TEXT)
         return
 
-    if SQS_QUEUE_URL:
-        _handle_request_pool(event, client, channel, thread_ts, is_dm, user_request, received_at)
-    else:
-        _handle_request_fargate(event, client, channel, thread_ts, is_dm, user_request, received_at)
+    _handle_request_pool(event, client, channel, thread_ts, is_dm, user_request, received_at)
 
 
 @app.action('cancel_claude_run')

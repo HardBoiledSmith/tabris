@@ -1,14 +1,10 @@
-"""Fargate 샌드박스 진입점 — 잡을 처리하는 워커. 두 가지 모드로 동작한다.
+"""Fargate 샌드박스 진입점 — 잡을 처리하는 워커(워밍 풀).
 
-(A) 워밍 풀(권장, `TABRIS_QUEUE_URL` 설정 시): ECS Service가 띄운 상주 워커가 SQS FIFO
-    큐를 long-poll 하며 잡을 소비한다. 콜드 부팅(ENI·이미지풀·인터프리터)을 유저 요청 임계경로에서
-    제거한다. 격리를 위해 잡 경계마다 workspace를 비우고, MAX_JOBS/MAX_LIFETIME마다 스스로
-    은퇴(exit 0)해 ECS가 새 태스크로 교체한다.
+ECS Service가 띄운 상주 워커가 SQS FIFO 큐를 long-poll 하며 잡을 소비한다. 콜드 부팅
+(ENI·이미지풀·인터프리터)을 유저 요청 임계경로에서 제거한다. 격리를 위해 잡 경계마다
+workspace를 비우고, MAX_JOBS/MAX_LIFETIME마다 스스로 은퇴(exit 0)해 ECS가 새 태스크로 교체한다.
 
-(B) 1회용(레거시, 큐 미설정 시): 봇이 ECS RunTask로 이 컨테이너를 띄우며 job 파라미터·시크릿을
-    env override로 주입한다. 잡 1건 처리 후 종료한다(롤백 안전망).
-
-공통 처리 흐름:
+처리 흐름:
   1. S3에서 prompt + 입력 파일을 내려받고
   2. 사용자 memory를 S3에서 동기화한 뒤
   3. claude CLI를 직접 실행하며(컨테이너 자체가 샌드박스이므로 docker run 래퍼 불필요)
@@ -93,7 +89,7 @@ MEMORY_S3_BUCKET = os.environ.get('MEMORY_S3_BUCKET', '')
 PROGRESS_INTERVAL_SEC = 10
 
 # --- 워밍 풀(루프 모드) 설정 ---
-# TABRIS_QUEUE_URL이 있으면 SQS FIFO를 소비하는 상주 루프로 동작한다(없으면 1회용 레거시).
+# SQS FIFO를 소비하는 상주 루프의 대상 큐. 필수 — 비어 있으면 기동을 거부한다.
 TABRIS_QUEUE_URL = os.environ.get('TABRIS_QUEUE_URL', '')
 # 격리·위생을 위해 워커를 오래 재활용하지 않는다: 둘 중 먼저 도달하는 쪽에서 은퇴(exit 0)한다.
 MAX_JOBS = int(os.environ.get('MAX_JOBS', '2'))
@@ -412,28 +408,12 @@ def run_claude_direct(prompt: str, progress_callback) -> tuple[int, str, dict | 
     return process.returncode, text_out, usage
 
 
-def _job_from_env() -> dict:
-    """1회용(레거시) 모드: RunTask env override로 주입된 job 파라미터를 dict로 읽는다."""
-    return {
-        'job_id': os.environ['TABRIS_JOB_ID'],
-        'channel': os.environ['TABRIS_SLACK_CHANNEL'],
-        'thread_ts': os.environ['TABRIS_SLACK_THREAD_TS'],
-        'waiting_msg_ts': os.environ['TABRIS_SLACK_WAITING_MSG_TS'],
-        'user_id': os.environ.get('TABRIS_SLACK_USER_ID', ''),
-        'prompt_s3_key': os.environ['TABRIS_PROMPT_S3_KEY'],
-        'input_files': json.loads(os.environ.get('TABRIS_INPUT_FILES_JSON', '[]')),
-        'request_epoch': float(os.environ.get('TABRIS_REQUEST_EPOCH') or 0),
-    }
+def process_job(job: dict, *, heartbeat=None, task_arn: str | None = None) -> None:
+    """잡 1건을 처리한다.
 
-
-def process_job(job: dict | None = None, *, heartbeat=None, task_arn: str | None = None) -> None:
-    """잡 1건을 처리한다. job=None이면 env에서 읽는다(레거시 1회용 호환).
-
-    heartbeat: 진행률 갱신(10초)마다 호출되는 콜백(풀 모드의 SQS visibility 연장용).
+    heartbeat: 진행률 갱신(10초)마다 호출되는 콜백(SQS visibility 연장용).
     task_arn: 취소 버튼에 담을 자기 task ARN. None이면 메타데이터로 조회한다.
     """
-    if job is None:
-        job = _job_from_env()
     job_id = job['job_id']
     channel = job['channel']
     thread_ts = job['thread_ts']
@@ -473,8 +453,8 @@ def process_job(job: dict | None = None, *, heartbeat=None, task_arn: str | None
         except Exception:
             logger.warning('Failed to post progress update', exc_info=True)
 
-    # 풀 모드: 봇이 취소 버튼을 못 달았으므로(어느 워커가 집을지 미정), 시작 즉시 한 번
-    # 진행 메시지를 갱신해 취소 버튼을 노출한다. 1회용 모드에선 봇이 이미 버튼을 달았다.
+    # 봇은 취소 버튼을 달지 못한다(어느 워커가 집을지 미정). 워커가 시작 즉시 한 번
+    # 진행 메시지를 갱신해 자기 task ARN으로 취소 버튼을 노출한다.
     if cancel_value:
         _progress_callback(_progress_waiting_text(0, CLAUDE_TIMEOUT))
 
@@ -608,25 +588,9 @@ def main_loop() -> None:
 
 
 def main() -> None:
-    if TABRIS_QUEUE_URL:
-        main_loop()
-        return
-    # 레거시 1회용(RunTask) 모드.
-    try:
-        process_job()
-    except Exception:
-        logger.exception('sandbox_worker failed')
-        # 가능하면 대기 메시지에 오류를 남긴다.
-        try:
-            WebClient(token=os.environ['SLACK_BOT_TOKEN']).chat_update(
-                channel=os.environ['TABRIS_SLACK_CHANNEL'],
-                ts=os.environ['TABRIS_SLACK_WAITING_MSG_TS'],
-                text='⚠️ 샌드박스 처리 중 오류가 발생했습니다.',
-                blocks=[],
-            )
-        except Exception:
-            pass
-        raise
+    if not TABRIS_QUEUE_URL:
+        raise RuntimeError('TABRIS_QUEUE_URL must be set')
+    main_loop()
 
 
 if __name__ == '__main__':

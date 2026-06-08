@@ -1,14 +1,14 @@
-"""End-to-end 테스트 (Fargate 디스패치 기준).
+"""End-to-end 테스트 (SQS 디스패치 기준).
 
 진입점: `on_mention` / `on_dm` (Slack Bolt가 호출하는 핸들러)
 경계 (외부 의존성):
   - Slack WebClient → MagicMock (`slack_client` fixture)
-  - Fargate 디스패치(`_run_claude_fargate`) → MagicMock (`dispatch_mock` fixture)
+  - SQS 디스패치(`_enqueue_claude_job`) → MagicMock (`dispatch_mock` fixture)
   - settings_local → conftest에서 stub
   - executor.submit → conftest에서 동기화
 
 샌드박스(claude 실행/결과 게시)는 별도 컨테이너(sandbox_worker)가 담당하므로,
-봇 e2e는 ACL 통과 시 "접수 메시지 게시 + RunTask 디스패치", 거부 시 "거부 메시지 + 디스패치 없음"만 검사한다.
+봇 e2e는 ACL 통과 시 "접수 메시지 게시 + SQS 디스패치", 거부 시 "거부 메시지 + 디스패치 없음"만 검사한다.
 """
 
 from unittest.mock import MagicMock
@@ -87,7 +87,7 @@ def test_received_at_passed_to_dispatch(run_server_module, slack_client, dispatc
     """봇이 메시지를 받은 시점(received_at)이 디스패치에 전달된다(샌드박스 실행시간 계산용)."""
     run_server_module.on_dm(_dm_event('hello'), slack_client)
 
-    # _run_claude_fargate(event, prompt, thread_ts, waiting_ts, slack_input_files, received_at)
+    # _enqueue_claude_job(event, prompt, thread_ts, waiting_ts, slack_input_files, received_at)
     received_at = dispatch_mock.call_args.args[5]
     assert isinstance(received_at, float) and received_at > 0
 
@@ -263,7 +263,7 @@ def test_thread_history_is_included_in_prompt(run_server_module, slack_client, d
     run_server_module.on_dm(_dm_event('current question'), slack_client)
 
     dispatch_mock.assert_called_once()
-    prompt = dispatch_mock.call_args.args[1]  # _run_claude_fargate(event, prompt, ...)
+    prompt = dispatch_mock.call_args.args[1]  # _enqueue_claude_job(event, prompt, ...)
     assert '이전 대화' in prompt
     assert 'earlier user question' in prompt
     assert 'earlier bot answer' in prompt

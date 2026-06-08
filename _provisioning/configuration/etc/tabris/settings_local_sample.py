@@ -19,17 +19,18 @@ ARTIFACTS_S3_BUCKET = 'hbsmith-tabris-artifacts'
 ARTIFACTS_BASE_URL = 'https://tabris-artifacts.hbsmith.io'
 DOCUMENTS_S3_BUCKET = 'hbsmith-tabris-documents'  # 사내 참고 자료 버킷 (aws_inspect Fast Path 대상)
 
-# --- Fargate 설정 (샌드박스는 항상 ECS Fargate RunTask로 실행) ---
+# --- Fargate 설정 (샌드박스는 ECS Fargate 워밍 풀로 실행) ---
 # run_create_poc.sh 실행 후 출력되는 값을 채워 넣는다. (poc_resources.env 참고)
 WORKSPACE_S3_BUCKET = 'hbsmith-tabris-workspace'  # 신규 workspace 버킷 (prompt/input/cancel)
-ECS_CLUSTER = 'tabris'
+ECS_CLUSTER = 'tabris'  # 봇 런타임: 취소(StopTask)에 사용
+# 아래는 봇 런타임이 아니라 프로비저닝 스크립트(run_create_poc.sh / run_terminate_poc.sh)가
+# 워밍 풀 인프라를 생성·삭제할 때 읽는 값이다.
 ECS_SANDBOX_TASK_DEFINITION = 'tabris-sandbox'
-ECS_SUBNET_IDS = 'subnet-xxxxxxxx,subnet-yyyyyyyy'  # 기본 VPC 퍼블릭 서브넷 (CSV)
+ECS_SUBNET_IDS = 'subnet-xxxxxxxx,subnet-yyyyyyyy'  # 기본 VPC 미사용 시 수동 지정 (CSV)
 ECS_SECURITY_GROUP_ID = 'sg-xxxxxxxx'
-ECS_ASSIGN_PUBLIC_IP = 'ENABLED'  # 퍼블릭 서브넷이므로 ENABLED (아웃바운드 인터넷용)
 
 # --- 워밍 풀(SQS) 디스패치 ---
-# 설정하면 봇은 RunTask(콜드) 대신 이 SQS FIFO 큐로 잡을 적재하고, 상주 워커 풀(ECS Service)이
-# 소비한다. 빈 문자열이면 위 ECS_* 기반 1회용 RunTask 경로로 동작한다(롤백 안전망).
+# 봇은 이 SQS FIFO 큐로 잡을 적재하고, 상주 워커 풀(ECS Service)이 소비한다.
+# 필수 — 비어 있으면 봇이 기동을 거부한다.
 # run_create_poc.sh 실행 후 출력되는 큐 URL을 채운다. (.fifo로 끝남)
-SQS_QUEUE_URL = ''  # 예: 'https://sqs.ap-northeast-2.amazonaws.com/788968797716/tabris-sandbox-jobs.fifo'
+SQS_QUEUE_URL = 'https://sqs.ap-northeast-2.amazonaws.com/788968797716/tabris-sandbox-jobs.fifo'  # 예시
