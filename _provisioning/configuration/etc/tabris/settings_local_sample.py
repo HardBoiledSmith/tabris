@@ -27,3 +27,9 @@ ECS_SANDBOX_TASK_DEFINITION = 'tabris-sandbox'
 ECS_SUBNET_IDS = 'subnet-xxxxxxxx,subnet-yyyyyyyy'  # 기본 VPC 퍼블릭 서브넷 (CSV)
 ECS_SECURITY_GROUP_ID = 'sg-xxxxxxxx'
 ECS_ASSIGN_PUBLIC_IP = 'ENABLED'  # 퍼블릭 서브넷이므로 ENABLED (아웃바운드 인터넷용)
+
+# --- 워밍 풀(SQS) 디스패치 ---
+# 설정하면 봇은 RunTask(콜드) 대신 이 SQS FIFO 큐로 잡을 적재하고, 상주 워커 풀(ECS Service)이
+# 소비한다. 빈 문자열이면 위 ECS_* 기반 1회용 RunTask 경로로 동작한다(롤백 안전망).
+# run_create_poc.sh 실행 후 출력되는 큐 URL을 채운다. (.fifo로 끝남)
+SQS_QUEUE_URL = ''  # 예: 'https://sqs.ap-northeast-2.amazonaws.com/788968797716/tabris-sandbox-jobs.fifo'

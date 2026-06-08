@@ -63,6 +63,10 @@ TASK_ROLE_NAME='tabris-sandbox-task-role'
 EXEC_ROLE_NAME='tabris-ecs-execution-role'
 LOG_GROUP='/ecs/tabris-sandbox'
 SG_NAME='tabris-sandbox-sg'
+# 워밍 풀 리소스(poc_resources.env가 있으면 그쪽 값이 우선 override).
+SERVICE_NAME="${SERVICE_NAME:-tabris-sandbox-pool}"
+QUEUE_NAME="${QUEUE_NAME:-tabris-sandbox-jobs.fifo}"
+DLQ_NAME="${DLQ_NAME:-tabris-sandbox-jobs-dlq.fifo}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_OUT="${SCRIPT_DIR}/poc_resources.env"
@@ -78,6 +82,26 @@ if [[ "${CALLER_ACCOUNT}" != "${ACCOUNT_ID}" ]]; then
   echo "❌ 현재 자격증명 계정(${CALLER_ACCOUNT})이 PoC 계정(${ACCOUNT_ID})과 다릅니다. 중단." >&2
   exit 1
 fi
+
+# ---------------------------------------------------------------------------
+# 0.5 워밍 풀: ECS Service + Auto Scaling 삭제 (클러스터 삭제보다 먼저)
+# ---------------------------------------------------------------------------
+RESOURCE_ID="service/${CLUSTER}/${SERVICE_NAME}"
+log "오토스케일 대상 deregister: ${RESOURCE_ID} (스케일 정책·스케줄드 함께 제거)"
+aws application-autoscaling deregister-scalable-target \
+  --service-namespace ecs --resource-id "${RESOURCE_ID}" \
+  --scalable-dimension ecs:service:DesiredCount >/dev/null 2>&1 \
+  && echo "deregistered" || echo "건너뜀(없음)"
+
+# step scaling 알람은 수동 생성이라 deregister로 안 지워진다 — 명시 삭제.
+log "CloudWatch 스케일 알람 삭제"
+aws cloudwatch delete-alarms \
+  --alarm-names tabris-pool-backlog-high tabris-pool-backlog-empty >/dev/null 2>&1 \
+  && echo "deleted alarms" || echo "건너뜀(없음)"
+
+log "ECS Service 삭제: ${SERVICE_NAME}"
+aws ecs delete-service --cluster "${CLUSTER}" --service "${SERVICE_NAME}" --force >/dev/null 2>&1 \
+  && echo "deleted" || echo "건너뜀(없음)"
 
 # ---------------------------------------------------------------------------
 # 1. 실행 중인 태스크 중지
@@ -181,6 +205,19 @@ else
     --image-ids "imageTag=${IMAGE_TAG}" >/dev/null 2>&1 \
     && echo "deleted" || echo "건너뜀(없음)"
 fi
+
+# ---------------------------------------------------------------------------
+# 9. SQS 큐 + DLQ 삭제
+# ---------------------------------------------------------------------------
+log "SQS 큐 삭제: ${QUEUE_NAME} / ${DLQ_NAME}"
+for qn in "${QUEUE_NAME}" "${DLQ_NAME}"; do
+  qurl="$(aws sqs get-queue-url --queue-name "${qn}" --query 'QueueUrl' --output text 2>/dev/null)"
+  if [[ -n "${qurl}" && "${qurl}" != "None" ]]; then
+    aws sqs delete-queue --queue-url "${qurl}" 2>/dev/null && echo "deleted ${qn}"
+  else
+    echo "건너뜀(${qn} 없음)"
+  fi
+done
 
 # 생성 스냅샷 정리
 rm -f "${ENV_OUT}"

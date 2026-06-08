@@ -24,7 +24,19 @@
         {"name": "ARTIFACTS_S3_BUCKET", "value": "${ARTIFACTS_BUCKET}"},
         {"name": "ARTIFACTS_BASE_URL", "value": "${ARTIFACTS_BASE_URL}"},
         {"name": "DOCUMENTS_S3_BUCKET", "value": "${DOCUMENTS_BUCKET}"},
-        {"name": "CLAUDE_TIMEOUT", "value": "1800"}
+        {"name": "CLAUDE_TIMEOUT", "value": "1800"},
+
+        {"name": "TABRIS_QUEUE_URL", "value": "${QUEUE_URL}"},
+        {"name": "MAX_JOBS", "value": "${MAX_JOBS}"},
+        {"name": "MAX_LIFETIME_SEC", "value": "${MAX_LIFETIME_SEC}"},
+        {"name": "SQS_VISIBILITY_TIMEOUT_SEC", "value": "${SQS_VISIBILITY_TIMEOUT_SEC}"},
+
+        {"name": "ANTHROPIC_API_KEY", "value": "${ANTHROPIC_API_KEY}"},
+        {"name": "SLACK_BOT_TOKEN", "value": "${SLACK_BOT_TOKEN}"},
+        {"name": "NERV_MCP_TOKEN", "value": "${NERV_MCP_TOKEN}"},
+        {"name": "ATLASSIAN_ROVO_MCP_TOKEN", "value": "${ATLASSIAN_ROVO_MCP_TOKEN}"},
+        {"name": "GITHUB_PAT", "value": "${GITHUB_PAT}"},
+        {"name": "SENTRY_AUTH_TOKEN", "value": "${SENTRY_AUTH_TOKEN}"}
       ],
       "logConfiguration": {
         "logDriver": "awslogs",

@@ -5,6 +5,7 @@ sandbox_worker.py가 봇 전체를 import하지 않고 Slack 게시/아티팩트
 재사용할 수 있도록 분리한 것이다.
 """
 
+import json
 import logging
 import os
 import re
@@ -345,10 +346,30 @@ def _progress_waiting_text(elapsed_sec: int, timeout_sec: int) -> str:
     return f'⏳ 처리 중… ({_format_duration(elapsed_sec)} / {_format_duration(timeout_sec)})'
 
 
+def encode_cancel_value(task_arn: str | None, job_id: str | None) -> str:
+    """취소 버튼 value: task ARN(StopTask 대상) + job_id(cancel 마커 키)를 JSON 한 줄로 인코딩한다.
+
+    워밍 풀에서는 봇이 디스패치 시점에 task ARN을 모르고(어느 워커가 집을지 미정), 워커가 잡을
+    집은 뒤 자기 ARN으로 버튼을 채운다. 봇 취소 핸들러는 이 값을 디코드해 마커를 먼저 쓰고 StopTask 한다.
+    """
+    return json.dumps({'task_arn': task_arn or '', 'job_id': job_id or ''}, separators=(',', ':'))
+
+
+def decode_cancel_value(value: str) -> tuple[str, str | None]:
+    """취소 버튼 value를 (task_arn, job_id)로 디코드한다. 레거시(평문 ARN) value도 그대로 수용한다."""
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return value, None  # 레거시: value 통째가 task ARN, job_id 없음
+    if isinstance(parsed, dict):
+        return parsed.get('task_arn') or '', (parsed.get('job_id') or None)
+    return value, None
+
+
 def _build_cancel_blocks(text: str, value: str) -> list[dict]:
     """대기/진행 메시지에 취소 버튼을 포함한 Block Kit blocks를 만든다.
 
-    value는 취소 동작 식별자다. docker 모드에서는 컨테이너 이름, fargate 모드에서는 job_id.
+    value는 취소 동작 식별자다. fargate 1회용은 task ARN, 워밍 풀은 encode_cancel_value(ARN+job_id).
     """
     return [
         {

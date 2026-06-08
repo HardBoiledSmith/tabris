@@ -21,6 +21,8 @@ from tabris_slack_utils import ARTIFACT_MAX_TOTAL_BYTES
 from tabris_slack_utils import WORKSPACE_INPUT_SUBDIR
 from tabris_slack_utils import _build_cancel_blocks
 from tabris_slack_utils import _sanitize_slack_attachment_filename
+from tabris_slack_utils import decode_cancel_value
+from tabris_slack_utils import encode_cancel_value
 
 sys.path.append('/etc/tabris')
 from settings_local import ALLOWED_TEAM_IDS
@@ -154,6 +156,13 @@ try:
     from settings_local import ALLOWED_ALL_USER_TEAM_IDS
 except ImportError:
     ALLOWED_ALL_USER_TEAM_IDS = ''
+
+# 워밍 풀 디스패치 큐. 설정돼 있으면 봇은 RunTask(콜드) 대신 이 SQS FIFO 큐로 잡을 적재하고,
+# 상주 워커 풀이 소비한다. 빈 문자열이면 레거시 1회용 RunTask 경로로 동작한다(롤백 안전망).
+try:
+    from settings_local import SQS_QUEUE_URL
+except ImportError:
+    SQS_QUEUE_URL = ''
 
 
 _ALLOWED_TEAM_IDS = _parse_ids(ALLOWED_TEAM_IDS)
@@ -354,6 +363,33 @@ def _ecs_stop_task(task_arn: str, reason: str, creds: dict) -> bool:
     return True
 
 
+def _sqs_send_message(queue_url: str, group_id: str, dedup_id: str, body: dict, creds: dict) -> dict:
+    """aws CLI로 SQS FIFO 큐에 메시지를 보낸다(boto3 미사용).
+
+    group_id: FIFO MessageGroupId(직렬화 경계 = 유저별 memory 미러 → user_id).
+    dedup_id: MessageDeduplicationId(job_id) — 5분 콘텐츠 중복 제거.
+    """
+    cmd = [
+        _aws_cli_executable(), 'sqs', 'send-message',
+        '--queue-url', queue_url,
+        '--message-group-id', group_id,
+        '--message-deduplication-id', dedup_id,
+        '--message-body', json.dumps(body),
+        '--output', 'json',
+    ]
+    result = subprocess.run(
+        cmd, env=_aws_creds_env(creds), capture_output=True, text=True, timeout=30, check=False
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f'sqs send-message 실패: {result.stderr[:300]}')
+    return json.loads(result.stdout or '{}')
+
+
+def _put_cancel_marker(job_id: str, creds: dict) -> None:
+    """jobs/{job_id}/cancel 마커(빈 객체)를 쓴다. 워커가 재배달 메시지를 보고 스킵하게 한다."""
+    _s3_put_bytes(WORKSPACE_S3_BUCKET, f'jobs/{job_id}/cancel', b'', creds)
+
+
 def _upload_slack_files_to_s3(event: dict, thread_ts: str) -> list[dict]:
     """트리거 메시지 첨부를 S3 `runs/{thread_ts}/input/`에 올린다.
 
@@ -431,6 +467,9 @@ def _run_claude_fargate(
 
     # 2. ECS RunTask — job 파라미터 + 시크릿/설정을 env override로 주입
     env_override = [
+        # 풀 task def엔 TABRIS_QUEUE_URL이 박혀 있다. RunTask(1회용)는 빈 값으로 덮어
+        # 워커가 루프 대신 process_job 1회만 돌게 강제한다(레거시/롤백 경로).
+        {'name': 'TABRIS_QUEUE_URL', 'value': ''},
         {'name': 'TABRIS_JOB_ID', 'value': job_id},
         {'name': 'TABRIS_SLACK_CHANNEL', 'value': channel},
         {'name': 'TABRIS_SLACK_THREAD_TS', 'value': thread_ts},
@@ -475,11 +514,58 @@ def _run_claude_fargate(
     return job_id, task_arn
 
 
-def _stop_task_fargate(task_arn: str, user_id: str, channel: str, msg_ts: str, client) -> str:
-    """ECS StopTask로 샌드박스 태스크를 즉시 종료한다(취소). 결과 문자열을 반환한다."""
+def _enqueue_claude_job(
+    event: dict, prompt: str, thread_ts: str, waiting_msg_ts: str, slack_input_files: list[dict], received_at: float
+) -> str:
+    """워밍 풀: prompt를 S3에 올리고 잡을 SQS FIFO 큐에 적재한다(워커가 소비). job_id를 반환한다.
+
+    직렬화 경계는 유저별 memory 미러이므로 MessageGroupId=user_id로 잡아, 같은 유저의 잡을
+    직렬화한다(memory 레이스·풀 과점유 방지). user_id가 비면 thread 기반으로 폴백한다.
+    취소 버튼은 봇이 여기서 달지 않는다 — 어느 워커가 집을지 모르므로, 워커가 자기 ARN으로 부착한다.
+    """
+    msg_id = event.get('client_msg_id') or event.get('ts')
+    job_id = _fargate_job_id(thread_ts, msg_id)
+    slack_user_id = event.get('user') or event.get('bot_id') or ''
+    channel = event['channel']
+
+    creds = _resolve_aws_credentials()
+    # prompt 본문은 메시지 크기 한도를 피하려고 S3 경유(워커가 prompt_s3_key로 내려받음).
+    prompt_key = f'runs/{thread_ts}/prompt.txt'
+    _s3_put_bytes(WORKSPACE_S3_BUCKET, prompt_key, prompt.encode('utf-8'), creds)
+
+    body = {
+        'job_id': job_id,
+        'channel': channel,
+        'thread_ts': thread_ts,
+        'waiting_msg_ts': waiting_msg_ts,
+        'user_id': slack_user_id,
+        'is_dm': _is_dm_channel(event),
+        'prompt_s3_key': prompt_key,
+        'input_files': slack_input_files,
+        # 봇이 메시지를 받은 시점(epoch). 워커는 이 값 기준으로 총 실행 시간을 계산한다.
+        'request_epoch': round(received_at, 3),
+    }
+    group_id = slack_user_id or f'thread:{thread_ts}'
+    _sqs_send_message(SQS_QUEUE_URL, group_id, job_id, body, creds)
+    logger.info('[SQS] enqueue job_id=%s group=%s', job_id, group_id)
+    return job_id
+
+
+def _stop_task_fargate(task_arn: str, job_id: str | None, user_id: str, channel: str, msg_ts: str, client) -> str:
+    """ECS StopTask로 샌드박스 태스크를 즉시 종료한다(취소). 결과 문자열을 반환한다.
+
+    풀 모드에선 StopTask가 워커를 SIGKILL 하므로 워커가 메시지를 삭제하지 못해 재배달될 수 있다.
+    그래서 StopTask **전에** cancel 마커를 먼저 써, 재배달된 잡을 다른 워커가 보고 스킵하게 한다.
+    """
     try:
         creds = _resolve_aws_credentials()
-        ok = _ecs_stop_task(task_arn, f'cancelled by Slack user {user_id}', creds)
+        # 마커 먼저(좀비 재실행 방지) → StopTask 나중. job_id는 워밍 풀 경로에서만 채워진다.
+        if job_id:
+            try:
+                _put_cancel_marker(job_id, creds)
+            except Exception:
+                logger.warning('cancel 마커 기록 실패(job=%s)', job_id, exc_info=True)
+        ok = _ecs_stop_task(task_arn, f'cancelled by Slack user {user_id}', creds) if task_arn else False
     except Exception:
         logger.exception('Failed to stop task %s', task_arn)
         ok = False
@@ -588,10 +674,49 @@ def _build_prompt(input_relpaths: list[str], context: str, request: str) -> str:
     return f'{input_note}## 현재 요청\n{request}'
 
 
-def _handle_request_fargate(event, client, channel, thread_ts, is_dm, user_request, received_at):
-    """Fargate 모드: ① 즉시 접수 메시지(버튼 없음) → ② S3 업로드·RunTask → ③ ARN 취소 버튼 부착.
+def _prepare_prompt(client, event, channel, thread_ts, is_dm, user_request):
+    """첨부 S3 업로드 + 스레드 히스토리 + 현재 요청을 합쳐 (prompt, slack_input_files)를 만든다.
 
-    취소 버튼 value에는 task ARN을 담아, 클릭 시 ecs StopTask로 태스크를 즉시 종료한다.
+    워밍 풀·1회용 두 디스패치 경로의 공용 전처리.
+    """
+    slack_input_files = _upload_slack_files_to_s3(event, thread_ts)
+    input_relpaths = [f'{WORKSPACE_INPUT_SUBDIR}/{f["filename"]}' for f in slack_input_files]
+    try:
+        replies = client.conversations_replies(channel=channel, ts=thread_ts)
+        history_msgs = replies.get('messages', [])[:-1]
+    except Exception:
+        logger.warning('Failed to fetch thread history', exc_info=True)
+        history_msgs = []
+    context = build_context(history_msgs, is_dm)
+    prompt = _build_prompt(input_relpaths, context, user_request)
+    return prompt, slack_input_files
+
+
+def _handle_request_pool(event, client, channel, thread_ts, is_dm, user_request, received_at):
+    """워밍 풀 모드: ① 즉시 접수 메시지 → ② S3 업로드 → ③ SQS 적재. 취소 버튼은 워커가 단다.
+
+    봇은 어느 워커가 잡을 집을지 모르므로(=task ARN 미정) 여기서 취소 버튼을 달지 않는다.
+    워커가 잡을 집는 즉시 자기 task ARN + job_id로 버튼을 부착한다.
+    """
+    initial_text = '⏳ 접수됨 — 샌드박스를 시작하고 있습니다…'
+    waiting_msg = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=initial_text)
+    try:
+        prompt, slack_input_files = _prepare_prompt(client, event, channel, thread_ts, is_dm, user_request)
+        _enqueue_claude_job(event, prompt, thread_ts, waiting_msg['ts'], slack_input_files, received_at)
+    except Exception as exc:
+        logger.exception('Failed to enqueue job to SQS')
+        try:
+            client.chat_update(
+                channel=channel, ts=waiting_msg['ts'], text=f'⚠️ 샌드박스 접수 실패: {exc}', blocks=[]
+            )
+        except Exception:
+            logger.warning('Failed to update waiting message after enqueue error', exc_info=True)
+
+
+def _handle_request_fargate(event, client, channel, thread_ts, is_dm, user_request, received_at):
+    """레거시 1회용 모드: ① 즉시 접수 메시지(버튼 없음) → ② S3 업로드·RunTask → ③ ARN 취소 버튼 부착.
+
+    취소 버튼 value에는 task ARN + job_id를 담아, 클릭 시 cancel 마커 후 ecs StopTask로 종료한다.
     태스크가 생기기 전(①~②)에는 취소할 대상이 없으므로 버튼을 달지 않는다.
     received_at: 봇이 메시지를 받은 시점(epoch). 샌드박스가 실행 시간 표시에 사용한다.
     """
@@ -600,20 +725,9 @@ def _handle_request_fargate(event, client, channel, thread_ts, is_dm, user_reque
     waiting_msg = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=initial_text)
 
     try:
-        slack_input_files = _upload_slack_files_to_s3(event, thread_ts)
-        input_relpaths = [f'{WORKSPACE_INPUT_SUBDIR}/{f["filename"]}' for f in slack_input_files]
-
-        try:
-            replies = client.conversations_replies(channel=channel, ts=thread_ts)
-            history_msgs = replies.get('messages', [])[:-1]
-        except Exception:
-            logger.warning('Failed to fetch thread history', exc_info=True)
-            history_msgs = []
-        context = build_context(history_msgs, is_dm)
-
-        prompt = _build_prompt(input_relpaths, context, user_request)
+        prompt, slack_input_files = _prepare_prompt(client, event, channel, thread_ts, is_dm, user_request)
         # ② RunTask → task ARN 획득
-        _job_id, task_arn = _run_claude_fargate(
+        job_id, task_arn = _run_claude_fargate(
             event, prompt, thread_ts, waiting_msg['ts'], slack_input_files, received_at
         )
     except Exception as exc:
@@ -629,14 +743,15 @@ def _handle_request_fargate(event, client, channel, thread_ts, is_dm, user_reque
             logger.warning('Failed to update waiting message after dispatch error', exc_info=True)
         return
 
-    # ③ ARN을 담은 취소 버튼 부착. 이후 진행률 업데이트 시 워커가 같은 ARN으로 버튼을 유지한다.
+    # ③ ARN+job_id를 담은 취소 버튼 부착. 이후 진행률 업데이트 시 워커가 같은 value로 버튼을 유지한다.
     if task_arn:
         try:
+            cancel_value = encode_cancel_value(task_arn, job_id)
             client.chat_update(
                 channel=channel,
                 ts=waiting_msg['ts'],
                 text=initial_text,
-                blocks=_build_cancel_blocks(initial_text, task_arn),
+                blocks=_build_cancel_blocks(initial_text, cancel_value),
             )
         except Exception:
             logger.warning('Failed to attach cancel button after dispatch', exc_info=True)
@@ -686,14 +801,18 @@ def handle_request(event: dict, client):
         _post_access_denied(client, channel, thread_ts, USER_ACCESS_DENIED_TEXT)
         return
 
-    _handle_request_fargate(event, client, channel, thread_ts, is_dm, user_request, received_at)
+    if SQS_QUEUE_URL:
+        _handle_request_pool(event, client, channel, thread_ts, is_dm, user_request, received_at)
+    else:
+        _handle_request_fargate(event, client, channel, thread_ts, is_dm, user_request, received_at)
 
 
 @app.action('cancel_claude_run')
 def on_cancel_claude_run(ack, body, client):
-    """취소 버튼 클릭 → ecs StopTask로 샌드박스 태스크를 종료한다. ALLOWED_TEAM_IDS 검사를 포함한다.
+    """취소 버튼 클릭 → cancel 마커 후 ecs StopTask로 샌드박스 태스크를 종료한다. ALLOWED_TEAM_IDS 검사 포함.
 
-    버튼 value에는 task ARN이 들어 있다(봇 디스패치 후 부착 / 워커 진행률 갱신 시 유지).
+    버튼 value는 task ARN + job_id를 인코딩한 것(레거시 평문 ARN도 수용). job_id가 있으면(풀 모드)
+    StopTask 전에 cancel 마커를 먼저 써 좀비 재실행을 막는다.
     """
     ack()
 
@@ -718,21 +837,22 @@ def on_cancel_claude_run(ack, body, client):
             logger.exception('Failed to post team access denied message for cancel action')
         return
 
-    task_arn = body['actions'][0]['value']
+    task_arn, job_id = decode_cancel_value(body['actions'][0]['value'])
     user_id = body['user']['id']
     channel = body['channel']['id']
     message_ts = body['message']['ts']
     thread_ts = body['message'].get('thread_ts') or message_ts
     cancel_team_id = _normalize_slack_team_id(action_team_id)
 
-    cancel_result = _stop_task_fargate(task_arn, user_id, channel, message_ts, client)
+    cancel_result = _stop_task_fargate(task_arn, job_id, user_id, channel, message_ts, client)
     logger.info(
-        '[CANCEL] team_id=%s channel=%s thread_ts=%s user=%s task=%s result=%s',
+        '[CANCEL] team_id=%s channel=%s thread_ts=%s user=%s task=%s job=%s result=%s',
         cancel_team_id,
         channel,
         thread_ts,
         user_id,
         task_arn,
+        job_id,
         cancel_result,
     )
 
