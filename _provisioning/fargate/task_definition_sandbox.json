@@ -1,0 +1,52 @@
+{
+  "family": "${TASK_FAMILY}",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "2048",
+  "memory": "4096",
+  "runtimePlatform": {
+    "cpuArchitecture": "ARM64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "taskRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/${TASK_ROLE_NAME}",
+  "executionRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/${EXEC_ROLE_NAME}",
+  "containerDefinitions": [
+    {
+      "name": "tabris-sandbox",
+      "image": "${REGISTRY}/hbsmith/tabris:${IMAGE_TAG}",
+      "command": ["python", "/opt/tabris/sandbox_worker.py"],
+      "essential": true,
+      "stopTimeout": 10,
+      "environment": [
+        {"name": "AWS_DEFAULT_REGION", "value": "${AWS_REGION}"},
+        {"name": "WORKSPACE_S3_BUCKET", "value": "${WORKSPACE_BUCKET}"},
+        {"name": "MEMORY_S3_BUCKET", "value": "${MEMORY_BUCKET}"},
+        {"name": "ARTIFACTS_S3_BUCKET", "value": "${ARTIFACTS_BUCKET}"},
+        {"name": "ARTIFACTS_BASE_URL", "value": "${ARTIFACTS_BASE_URL}"},
+        {"name": "DOCUMENTS_S3_BUCKET", "value": "${DOCUMENTS_BUCKET}"},
+        {"name": "CLAUDE_TIMEOUT", "value": "1800"},
+
+        {"name": "TABRIS_QUEUE_URL", "value": "${QUEUE_URL}"},
+        {"name": "MAX_JOBS", "value": "${MAX_JOBS}"},
+        {"name": "MAX_LIFETIME_SEC", "value": "${MAX_LIFETIME_SEC}"},
+        {"name": "SQS_VISIBILITY_TIMEOUT_SEC", "value": "${SQS_VISIBILITY_TIMEOUT_SEC}"}
+      ],
+      "secrets": [
+        {"name": "ANTHROPIC_API_KEY",        "valueFrom": "arn:aws:ssm:${AWS_REGION}:${ACCOUNT_ID}:parameter${SSM_PREFIX}ANTHROPIC_API_KEY"},
+        {"name": "SLACK_BOT_TOKEN",          "valueFrom": "arn:aws:ssm:${AWS_REGION}:${ACCOUNT_ID}:parameter${SSM_PREFIX}SLACK_BOT_TOKEN"},
+        {"name": "NERV_MCP_TOKEN",           "valueFrom": "arn:aws:ssm:${AWS_REGION}:${ACCOUNT_ID}:parameter${SSM_PREFIX}NERV_MCP_TOKEN"},
+        {"name": "ATLASSIAN_ROVO_MCP_TOKEN", "valueFrom": "arn:aws:ssm:${AWS_REGION}:${ACCOUNT_ID}:parameter${SSM_PREFIX}ATLASSIAN_ROVO_MCP_TOKEN"},
+        {"name": "GITHUB_PAT",               "valueFrom": "arn:aws:ssm:${AWS_REGION}:${ACCOUNT_ID}:parameter${SSM_PREFIX}GITHUB_PAT"},
+        {"name": "SENTRY_AUTH_TOKEN",        "valueFrom": "arn:aws:ssm:${AWS_REGION}:${ACCOUNT_ID}:parameter${SSM_PREFIX}SENTRY_AUTH_TOKEN"}
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "${LOG_GROUP}",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "sandbox"
+        }
+      }
+    }
+  ]
+}

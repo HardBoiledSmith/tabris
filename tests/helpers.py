@@ -1,9 +1,9 @@
-"""테스트 전용 헬퍼 (run_server subprocess 목 등)."""
+"""테스트 전용 헬퍼 (sandbox_worker subprocess 목 등)."""
 
 import threading
 from unittest.mock import MagicMock
 
-import run_server
+import sandbox_worker
 
 
 class FakeReadableStream:
@@ -37,7 +37,7 @@ def install_claude_popen_mock(
     stderr_text: str = '',
     cmd_capture: dict | None = None,
 ):
-    """`run_server.subprocess.Popen`을 패치해 Docker 없이 Claude stdout/stderr를 시뮬레이션한다."""
+    """`sandbox_worker.subprocess.Popen`을 패치해 실제 claude 없이 stdout/stderr를 시뮬레이션한다."""
 
     done = threading.Event()
     pending = [2]
@@ -65,4 +65,4 @@ def install_claude_popen_mock(
             cmd_capture['cmd'] = cmd
         return FakeProc()
 
-    monkeypatch.setattr(run_server.subprocess, 'Popen', factory)
+    monkeypatch.setattr(sandbox_worker.subprocess, 'Popen', factory)

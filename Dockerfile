@@ -25,10 +25,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN npm install -g @anthropic-ai/claude-code @sentry/cli
 
+COPY _provisioning/requirements_worker.txt /tmp/requirements_worker.txt
+RUN pip install --no-cache-dir -r /tmp/requirements_worker.txt
+
 RUN useradd -m -u 1001 claude
 
 # Repo-managed Claude config/skills under /home/claude (build context: repo root).
 COPY --chown=claude:claude _provisioning/configuration/docker/home/claude/ /home/claude/
+
+COPY --chown=claude:claude tabris_slack_utils.py /opt/tabris/tabris_slack_utils.py
+COPY --chown=claude:claude sandbox_worker.py     /opt/tabris/sandbox_worker.py
 
 USER claude
 

@@ -1,25 +1,18 @@
-"""Slack 트리거 메시지 첨부 → `input/` 저장 및 DM subtype 처리."""
+"""Slack 트리거 메시지 첨부 → S3 `runs/{thread}/input/` 업로드 및 DM subtype 처리."""
 
 from unittest.mock import MagicMock
 
 import run_server
 
 
-class _FakeHTTPResponse:
-    """`urllib.request.urlopen` 컨텍스트 매니저용 스텁."""
-
-    def __init__(self, body: bytes, headers: dict | None = None):
-        self._body = body
-        self.headers = headers or {}
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-    def read(self, max_plus_one: int):
-        return self._body[:max_plus_one]
+def _stub_creds_and_put(monkeypatch):
+    """자격증명 해석과 S3 put을 무력화하고, 업로드 호출을 기록하는 list를 돌려준다."""
+    monkeypatch.setattr(run_server, '_resolve_aws_credentials', lambda: {
+        'AWS_ACCESS_KEY_ID': 'a', 'AWS_SECRET_ACCESS_KEY': 's', 'AWS_SESSION_TOKEN': 't',
+    })
+    puts = []
+    monkeypatch.setattr(run_server, '_s3_put_bytes', lambda bucket, key, body, creds: puts.append((key, body)))
+    return puts
 
 
 def test_sanitize_strips_path_segments():
@@ -27,85 +20,45 @@ def test_sanitize_strips_path_segments():
     assert run_server._sanitize_slack_attachment_filename('') == 'attached'
 
 
-def test_download_writes_input(tmp_path, monkeypatch):
-    ws = tmp_path / 'ws'
-    ws.mkdir()
+def test_upload_writes_to_s3(monkeypatch):
+    puts = _stub_creds_and_put(monkeypatch)
+    monkeypatch.setattr(run_server, '_read_slack_private_url', lambda url, token, mx: b'hello')
+
     event = {
         'files': [
-            {
-                'id': 'F1',
-                'name': 'note.txt',
-                'size': 5,
-                'url_private_download': 'https://files.slack.com/fake',
-            }
+            {'id': 'F1', 'name': 'note.txt', 'size': 5, 'url_private_download': 'https://files.slack.com/fake'}
         ]
     }
+    out = run_server._upload_slack_files_to_s3(event, '1700000000.000001')
 
-    def fake_urlopen(req, timeout=90):
-        assert 'Authorization' in req.headers
-        return _FakeHTTPResponse(b'hello')
-
-    monkeypatch.setattr(run_server.urllib.request, 'urlopen', fake_urlopen)
-    paths = run_server.download_slack_message_files_to_input(event, str(ws), 'xoxb-test')
-    assert paths == ['input/note.txt']
-    assert (ws / 'input' / 'note.txt').read_bytes() == b'hello'
+    assert out == [{'filename': 'note.txt', 's3_key': 'runs/1700000000.000001/input/note.txt'}]
+    assert puts == [('runs/1700000000.000001/input/note.txt', b'hello')]
 
 
-def test_download_skips_without_url(tmp_path):
-    ws = tmp_path / 'ws'
-    ws.mkdir()
+def test_upload_skips_without_url(monkeypatch):
+    _stub_creds_and_put(monkeypatch)
     event = {'files': [{'id': 'F1', 'name': 'a.bin'}]}
-    assert run_server.download_slack_message_files_to_input(event, str(ws), 'xoxb-test') == []
+    assert run_server._upload_slack_files_to_s3(event, 'TS') == []
 
 
-def test_download_skips_when_declared_size_over_limit(tmp_path, monkeypatch):
-    ws = tmp_path / 'ws'
-    ws.mkdir()
+def test_upload_no_files_returns_empty(monkeypatch):
+    _stub_creds_and_put(monkeypatch)
+    assert run_server._upload_slack_files_to_s3({}, 'TS') == []
+
+
+def test_upload_duplicate_names_get_suffix(monkeypatch):
+    _stub_creds_and_put(monkeypatch)
+    monkeypatch.setattr(run_server, '_read_slack_private_url', lambda url, token, mx: b'x')
+
     event = {
         'files': [
-            {
-                'name': 'huge.bin',
-                'size': run_server.ARTIFACT_MAX_BYTES_PER_FILE + 1,
-                'url_private_download': 'https://files.slack.com/fake',
-            }
+            {'name': 'same.txt', 'size': 1, 'url_private_download': 'https://files.slack.com/1'},
+            {'name': 'same.txt', 'size': 1, 'url_private_download': 'https://files.slack.com/2'},
         ]
     }
-    called = []
-
-    def fake_urlopen(req, timeout=90):
-        called.append(True)
-        return _FakeHTTPResponse(b'x')
-
-    monkeypatch.setattr(run_server.urllib.request, 'urlopen', fake_urlopen)
-    assert run_server.download_slack_message_files_to_input(event, str(ws), 'xoxb-test') == []
-    assert not called
-
-
-def test_download_duplicate_names_get_suffix(tmp_path, monkeypatch):
-    ws = tmp_path / 'ws'
-    ws.mkdir()
-    event = {
-        'files': [
-            {
-                'name': 'same.txt',
-                'size': 1,
-                'url_private_download': 'https://files.slack.com/1',
-            },
-            {
-                'name': 'same.txt',
-                'size': 1,
-                'url_private_download': 'https://files.slack.com/2',
-            },
-        ]
-    }
-    bodies = [b'a', b'b']
-
-    def fake_urlopen(req, timeout=90):
-        return _FakeHTTPResponse(bodies.pop(0))
-
-    monkeypatch.setattr(run_server.urllib.request, 'urlopen', fake_urlopen)
-    paths = run_server.download_slack_message_files_to_input(event, str(ws), 'xoxb-test')
-    assert sorted(paths) == ['input/same.txt', 'input/same_2.txt']
+    out = run_server._upload_slack_files_to_s3(event, 'TS')
+    names = sorted(f['filename'] for f in out)
+    assert names == ['same.txt', 'same_2.txt']
 
 
 def test_on_dm_file_share_calls_submit(monkeypatch):
@@ -116,12 +69,7 @@ def test_on_dm_file_share_calls_submit(monkeypatch):
 
     monkeypatch.setattr(run_server, '_submit', fake_submit)
     run_server.on_dm(
-        {
-            'channel_type': 'im',
-            'subtype': 'file_share',
-            'ts': '1.0',
-            'files': [],
-        },
+        {'channel_type': 'im', 'subtype': 'file_share', 'ts': '1.0', 'files': []},
         MagicMock(),
     )
     assert len(called) == 1
@@ -147,30 +95,23 @@ def test_enrich_event_noop_when_team_present():
 
 def test_on_dm_unknown_subtype_skips(monkeypatch):
     called = []
-
     monkeypatch.setattr(run_server, '_submit', lambda e, c, context=None: called.append(True))
     run_server.on_dm(
-        {
-            'channel_type': 'im',
-            'subtype': 'message_changed',
-            'ts': '1.0',
-        },
+        {'channel_type': 'im', 'subtype': 'message_changed', 'ts': '1.0'},
         MagicMock(),
     )
     assert not called
 
 
-def test_handle_request_file_only_invokes_run_claude(monkeypatch, slack_client):
-    seen = []
-
-    def fake_run_claude(event, context, user_request, progress_callback=None):
-        seen.append(user_request)
-        return 'done'
-
-    monkeypatch.setattr(run_server, 'run_claude', fake_run_claude)
-    monkeypatch.setattr(run_server, 'post_claude_markdown_to_thread', MagicMock())
-    monkeypatch.setattr(run_server, 'post_workspace_artifacts_to_thread', MagicMock())
-    monkeypatch.setattr(run_server.shutil, 'rmtree', MagicMock())
+def test_handle_request_file_only_dispatches_with_input_note(monkeypatch, slack_client):
+    """텍스트 없이 첨부만 있는 메시지도 디스패치되며, 프롬프트에 input 안내가 들어간다."""
+    dispatch = MagicMock(return_value='job')
+    monkeypatch.setattr(run_server, '_enqueue_claude_job', dispatch)
+    monkeypatch.setattr(
+        run_server,
+        '_upload_slack_files_to_s3',
+        lambda event, thread_ts: [{'filename': 'x.txt', 's3_key': 'runs/TS/input/x.txt'}],
+    )
 
     event = {
         'channel': 'D123',
@@ -179,14 +120,11 @@ def test_handle_request_file_only_invokes_run_claude(monkeypatch, slack_client):
         'user': 'U_USER',
         'thread_ts': '1700000000.000001',
         'text': '',
-        'files': [
-            {
-                'name': 'x.txt',
-                'size': 1,
-                'url_private_download': 'https://example.com/f',
-            }
-        ],
+        'files': [{'name': 'x.txt', 'size': 1, 'url_private_download': 'https://example.com/f'}],
     }
     run_server.handle_request(event, slack_client)
-    assert seen and 'input' in seen[0].lower()
+
+    dispatch.assert_called_once()
+    prompt = dispatch.call_args.args[1]
+    assert '/workspace/input/x.txt' in prompt
     assert slack_client.chat_postMessage.called

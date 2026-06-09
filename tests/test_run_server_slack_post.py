@@ -11,10 +11,10 @@ from unittest.mock import MagicMock
 import pytest
 from slack_sdk.errors import SlackApiError
 
-import run_server
-from run_server import SLACK_MSG_FILE_NOTICE
-from run_server import SLACK_MSG_REDIRECT_NOTICE
-from run_server import post_claude_markdown_to_thread
+import tabris_slack_utils
+from tabris_slack_utils import SLACK_MSG_FILE_NOTICE
+from tabris_slack_utils import SLACK_MSG_REDIRECT_NOTICE
+from tabris_slack_utils import post_claude_markdown_to_thread
 
 _CHANNEL = 'C_TEST'
 _THREAD_TS = '111.0'
@@ -48,9 +48,9 @@ def client():
 def _stub_markdown_converter(monkeypatch):
     """markdown → 단일 블록 반환으로 고정해 Slack 변환 라이브러리와 분리한다."""
     fake_block = [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': _SOURCE_TEXT}}]
-    monkeypatch.setattr(run_server, 'convert_markdown_to_slack_blocks', lambda *a, **kw: fake_block)
+    monkeypatch.setattr(tabris_slack_utils, 'convert_markdown_to_slack_blocks', lambda *a, **kw: fake_block)
     monkeypatch.setattr(
-        run_server,
+        tabris_slack_utils,
         'build_fallback_text_from_blocks',
         lambda blocks, **kw: _SOURCE_TEXT if blocks else '',
     )
@@ -205,7 +205,7 @@ def test_second_chunk_uses_post_only(client, monkeypatch):
     """50블록 초과 시 첫 chunk는 update, 나머지는 postMessage만."""
     block = {'type': 'section', 'text': {'type': 'mrkdwn', 'text': 'x'}}
     # 51개 블록 반환 → 2개 chunk
-    monkeypatch.setattr(run_server, 'convert_markdown_to_slack_blocks', lambda *a, **kw: [block] * 51)
+    monkeypatch.setattr(tabris_slack_utils, 'convert_markdown_to_slack_blocks', lambda *a, **kw: [block] * 51)
 
     post_claude_markdown_to_thread(client, _CHANNEL, _THREAD_TS, _MARKDOWN, _UPDATE_TS)
 

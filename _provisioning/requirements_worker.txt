@@ -1,0 +1,4 @@
+# Fargate 샌드박스 워커(sandbox_worker.py) 전용 의존성. Docker 이미지에만 설치된다.
+# S3 접근은 boto3 대신 이미지에 이미 설치된 aws CLI를 subprocess로 호출한다.
+slack-sdk>=3.33.0
+slack-markdown-parser>=2.4.3
