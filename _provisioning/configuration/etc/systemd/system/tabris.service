@@ -1,8 +1,7 @@
 [Unit]
-Description=tabris - Slack Bolt bot running Claude Code in Docker sandboxes
-After=network-online.target docker.service
+Description=tabris - Slack Bolt bot dispatching Claude Code jobs to a Fargate warm pool (SQS)
+After=network-online.target
 Wants=network-online.target
-Requires=docker.service
 
 [Service]
 Type=simple

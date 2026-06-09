@@ -118,16 +118,6 @@ def _setup_venv():
     _run([venv_pip, 'install', 'ruff'])
 
 
-def _setup_docker():
-    _print_line_number()
-
-    _run(['dnf', '-y', 'install', 'docker'])
-    _run(['systemctl', 'enable', 'docker'])
-    _run(['systemctl', 'start', 'docker'])
-
-    _run(['docker', 'build', '-t', 'hbsmith-claude-sandbox', '/opt/tabris'])
-
-
 def main():
     _print_line_number()
 
@@ -197,10 +187,6 @@ def main():
     _print_line_number()
 
     _setup_venv()
-
-    _print_line_number()
-
-    _setup_docker()
 
     _print_line_number()
 
