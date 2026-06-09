@@ -26,9 +26,9 @@ set -euo pipefail
 # 설정 (필요 시 환경변수로 override)
 # ---------------------------------------------------------------------------
 AWS_REGION="${AWS_REGION:-ap-northeast-2}"
-export AWS_PROFILE="${AWS_PROFILE:-hbsmith-dv}"
+export AWS_PROFILE="${AWS_PROFILE:-hbsmith-op}"
 ACCOUNT_ID="${ACCOUNT_ID:-788968797716}"
-REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+REGISTRY="591379657681.dkr.ecr.${AWS_REGION}.amazonaws.com"
 ECR_REPO="hbsmith/tabris"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 
