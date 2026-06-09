@@ -421,7 +421,7 @@ def process_job(job: dict, *, heartbeat=None, task_arn: str | None = None) -> No
     slack_user_id = job.get('user_id', '')
     prompt_s3_key = job['prompt_s3_key']
     input_files = job.get('input_files') or []
-    # 봇이 메시지를 받은 시점(epoch). 실행 시간 = (워커 종료 시각 - 이 값)으로 디스패치/cold start 포함.
+    # 봇이 메시지를 받은 시점(epoch). 워커 시작 시각과의 차이로 큐 대기 시간(queued_sec)을 산출한다.
     request_epoch = float(job.get('request_epoch') or 0)
 
     slack = WebClient(token=os.environ['SLACK_BOT_TOKEN'])
@@ -468,8 +468,11 @@ def process_job(job: dict, *, heartbeat=None, task_arn: str | None = None) -> No
         }
     )
 
-    # 봇이 메시지를 받은 시점부터 측정(없으면 워커 시작 시점으로 폴백).
-    run_start = request_epoch or time.time()
+    # 워커가 잡을 집어 실제 처리를 시작한 시점부터 측정(큐 대기 시간 제외).
+    # FIFO MessageGroupId(사용자별) 직렬화로 뒷순위 잡이 기다린 시간은 elapsed에 넣지 않고,
+    # queued_sec로 따로 기록한다.
+    run_start = time.time()
+    queued_sec = int(run_start - request_epoch) if request_epoch else None
     prompt = download_prompt_from_s3(prompt_s3_key)
     download_inputs_from_s3(input_files)
     sync_memory_from_s3(slack_user_id)
@@ -504,6 +507,7 @@ def process_job(job: dict, *, heartbeat=None, task_arn: str | None = None) -> No
                 'input_tokens': u.get('input_tokens'),
                 'output_tokens': u.get('output_tokens'),
                 'elapsed_sec': elapsed_sec,
+                'queued_sec': queued_sec,
             }
         )
         try:
