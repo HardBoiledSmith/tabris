@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
 #
-# run_create_poc.sh — Tabris Fargate 샌드박스 PoC용 AWS 리소스를 788968797716 계정에 생성한다.
+# run_create.sh — Tabris Fargate 샌드박스 운영 AWS 리소스를 op 계정(187063173014)에 생성한다.
 #
 # 생성 대상:
-#   - ECR 이미지 (hbsmith/tabris:latest, ARM64)  ※ 기존 :latest 등과 충돌하지 않도록 전용 태그
+#   - ECR 이미지 (hbsmith/tabris:latest, ARM64)  ※ 공유 계정(591379657681) repo에 cross-account push
 #   - S3 workspace 버킷 (prompt/input/cancel, lifecycle 1일)
 #   - IAM: task role + execution role
 #   - CloudWatch Logs 그룹
-#   - ECS 클러스터 (FARGATE)
-#   - 보안그룹 (기본 VPC, egress all)  + 기본 VPC 퍼블릭 서브넷 자동 탐지
+#   - ECS 클러스터 (FARGATE) + 워밍 풀 서비스/오토스케일
 #   - ECS Task Definition 등록 (tabris-sandbox)
+#   - 봇 EB role(tabris-test-ec2-role)에 디스패치 권한(SQS/S3/StopTask) 인라인 부착
 #
-# 봇은 EB가 아니라 기존 Vagrant에서 그대로 돌리고, run_server.py가 ecs.run_task()를 직접 호출한다.
-# 시크릿은 RunTask env override로 주입하므로 Secrets Manager는 만들지 않는다.
+# 네트워크(서브넷·보안그룹·퍼블릭 IP 여부)는 settings_local.py에서 읽는다(기본 VPC 자동 탐지 안 함):
+#   ECS_SUBNET_IDS / ECS_SECURITY_GROUP_ID / ECS_ASSIGN_PUBLIC_IP.
+#   프라이빗 서브넷(assignPublicIp=DISABLED) 사용 시 ECR/S3/SQS/SSM/Logs/Anthropic 아웃바운드를 위해
+#   해당 서브넷에 NAT(또는 VPC 엔드포인트)가 있어야 한다.
 #
-# 사전 조건: aws CLI v2 + docker. AWS 자격증명은 788968797716 계정을 가리켜야 한다.
-#            (예: export AWS_PROFILE=<788968797716 프로파일> 후 aws sso login)
+# 봇은 op 계정 EB에서 구동되고 run_server.py가 SQS로 잡을 디스패치한다.
+# 시크릿은 SSM Parameter Store(SecureString)에 적재하고 task def secrets 블록이 참조한다.
 #
-# 사용법:  ./run_create_poc.sh
-#          IMAGE_TAG=latest SKIP_BUILD=1 ./run_create_poc.sh   # 이미지 빌드/푸시 생략
+# 사전 조건: aws CLI v2 + docker. AWS 자격증명은 op 계정(187063173014)을 가리켜야 하고,
+#            공유 계정(591379657681) ECR repo에 push 권한이 있어야 한다.
+#            (예: export AWS_PROFILE=<op 계정 프로파일> 후 aws sso login)
+#
+# 사용법:  ./run_create.sh
+#          IMAGE_TAG=latest SKIP_BUILD=1 ./run_create.sh   # 이미지 빌드/푸시 생략
 
 set -euo pipefail
 
@@ -26,15 +32,16 @@ set -euo pipefail
 # 설정 (필요 시 환경변수로 override)
 # ---------------------------------------------------------------------------
 AWS_REGION="${AWS_REGION:-ap-northeast-2}"
+ACCOUNT_ID="${ACCOUNT_ID:-187063173014}"   # op 계정. 자격증명이 이 계정을 가리켜야 함.
 export AWS_PROFILE="${AWS_PROFILE:-hbsmith-op}"
-ACCOUNT_ID="${ACCOUNT_ID:-788968797716}"
+# 이미지는 공유 계정(591379657681) repo에 둔다. op 계정 자격증명으로 cross-account push/pull한다.
 REGISTRY="591379657681.dkr.ecr.${AWS_REGION}.amazonaws.com"
 ECR_REPO="hbsmith/tabris"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 
-# --- 봇 settings_local.py에서 버킷/클러스터/태스크 이름을 읽어 기본값으로 사용 ---
+# --- 봇 settings_local.py에서 버킷/클러스터/태스크/네트워크 값을 읽어 기본값으로 사용 ---
 # 우선순위: 명시적 env > settings_local 값 > 스크립트 내장 기본값.
-# 이렇게 PoC 리소스 이름을 봇 설정과 항상 일치시켜 불일치로 인한 AccessDenied를 막는다.
+# 이렇게 리소스 이름·네트워크를 봇 설정과 항상 일치시켜 불일치로 인한 AccessDenied를 막는다.
 SETTINGS_FILE="${TABRIS_SETTINGS:-/etc/tabris/settings_local.py}"
 if [[ ! -f "${SETTINGS_FILE}" ]]; then
   echo "❌ settings_local.py를 찾을 수 없습니다: ${SETTINGS_FILE}" >&2
@@ -57,6 +64,10 @@ mapping = {
     'CFG_ARTIFACTS_BASE_URL': 'ARTIFACTS_BASE_URL',
     'CFG_CLUSTER':            'ECS_CLUSTER',
     'CFG_TASK_FAMILY':        'ECS_SANDBOX_TASK_DEFINITION',
+    # 네트워크: 기본 VPC를 탐지하지 않고 운영 서브넷/SG/퍼블릭IP 여부를 설정에서 읽는다.
+    'CFG_SUBNET_IDS':         'ECS_SUBNET_IDS',
+    'CFG_SG_ID':              'ECS_SECURITY_GROUP_ID',
+    'CFG_ASSIGN_PUBLIC_IP':   'ECS_ASSIGN_PUBLIC_IP',
     # 시크릿은 SSM Parameter Store(SecureString)에 적재하고 task def secrets 블록이 참조한다.
     # 워커는 평소처럼 env로 받으므로(ECS가 시작 시 주입) 코드는 그대로다.
     'CFG_ANTHROPIC_API_KEY':  'ANTHROPIC_API_KEY',
@@ -74,11 +85,12 @@ for shvar, pykey in mapping.items():
 PY
 )"
 
-# 인프라 리소스 이름(설정 파일에 없음). PoC 전용이라 고정.
+# 인프라 리소스 이름(설정 파일에 없음). 고정.
 TASK_ROLE_NAME='tabris-sandbox-task-role'
 EXEC_ROLE_NAME='tabris-ecs-execution-role'
 LOG_GROUP='/ecs/tabris-sandbox'
-SG_NAME='tabris-sandbox-sg'
+# 봇이 구동되는 EB 인스턴스 role. 디스패치 권한(SQS/S3/StopTask)을 인라인으로 부착한다.
+BOT_ROLE_NAME="${BOT_ROLE_NAME:-tabris-test-ec2-role}"
 # 시크릿은 평문 env 대신 SSM Parameter Store(SecureString)에 두고, task def의 secrets 블록이
 # valueFrom으로 참조한다(콘솔/RunTask 호출에 평문 미노출). 파라미터 이름 접두사.
 SSM_PREFIX='/tabris/sandbox/'
@@ -87,7 +99,7 @@ SSM_PREFIX='/tabris/sandbox/'
 QUEUE_NAME="${QUEUE_NAME:-tabris-sandbox-jobs.fifo}"
 DLQ_NAME="${DLQ_NAME:-tabris-sandbox-jobs-dlq.fifo}"
 SERVICE_NAME="${SERVICE_NAME:-tabris-sandbox-pool}"
-MAX_JOBS="${MAX_JOBS:-2}"
+MAX_JOBS="${MAX_JOBS:-1}"
 MAX_LIFETIME_SEC="${MAX_LIFETIME_SEC:-2700}"
 SQS_VISIBILITY_TIMEOUT_SEC="${SQS_VISIBILITY_TIMEOUT_SEC:-360}"
 POOL_MAX_TASKS="${POOL_MAX_TASKS:-5}"            # autoscaling 상한
@@ -105,6 +117,12 @@ ARTIFACTS_BASE_URL="${CFG_ARTIFACTS_BASE_URL:?settings_local.py에 ARTIFACTS_BAS
 CLUSTER="${CFG_CLUSTER:?settings_local.py에 ECS_CLUSTER가 없습니다}"
 TASK_FAMILY="${CFG_TASK_FAMILY:?settings_local.py에 ECS_SANDBOX_TASK_DEFINITION가 없습니다}"
 
+# 네트워크: ID(subnet-*/sg-*) 또는 이름(태그/그룹명)을 받는다. 이름은 아래 0.5에서 ID로 해석.
+# 퍼블릭 IP 여부는 기본 DISABLED(프라이빗 서브넷 전제).
+SUBNET_SPEC="${CFG_SUBNET_IDS:?settings_local.py에 ECS_SUBNET_IDS가 없습니다}"
+SG_SPEC="${CFG_SG_ID:?settings_local.py에 ECS_SECURITY_GROUP_ID가 없습니다}"
+ASSIGN_PUBLIC_IP="${CFG_ASSIGN_PUBLIC_IP:-DISABLED}"
+
 # 시크릿은 settings_local에서 읽어 SSM에 적재한다(아래 6.7). task def는 SSM을 valueFrom으로 참조.
 ANTHROPIC_API_KEY="${CFG_ANTHROPIC_API_KEY:?settings_local.py에 ANTHROPIC_API_KEY가 없습니다}"
 SLACK_BOT_TOKEN="${CFG_SLACK_BOT_TOKEN:?settings_local.py에 SLACK_BOT_TOKEN가 없습니다}"
@@ -116,13 +134,14 @@ JIRA_API_USERNAME="${CFG_JIRA_API_USERNAME:?settings_local.py에 JIRA_API_USERNA
 # Atlassian MCP Basic auth: base64("user:api_key") — run_server.py와 동일 규칙.
 ATLASSIAN_ROVO_MCP_TOKEN="$(printf '%s:%s' "${JIRA_API_USERNAME}" "${JIRA_API_KEY}" | base64 | tr -d '\n')"
 
-# aws_inspect 스킬이 assume하는 OrchestratorRole (read-only 체인 진입점)
-ORCHESTRATOR_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/ai-agent/HBsmithAIAgent-InspectOrchestratorRole"
+# aws_inspect 스킬이 assume하는 OrchestratorRole (read-only 체인 진입점).
+# 이 role은 공유 계정(591379657681)에 존재한다(aws_inspect 스킬과 동일). op 계정이 아님에 주의.
+ORCHESTRATOR_ROLE_ARN="arn:aws:iam::591379657681:role/ai-agent/HBsmithAIAgent-InspectOrchestratorRole"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TEMPLATE="${SCRIPT_DIR}/task_definition_sandbox.json"
-ENV_OUT="${SCRIPT_DIR}/poc_resources.env"
+ENV_OUT="${SCRIPT_DIR}/resources.env"
 
 log() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 aws() { command aws --region "${AWS_REGION}" "$@"; }
@@ -133,11 +152,72 @@ aws() { command aws --region "${AWS_REGION}" "$@"; }
 log "AWS 자격증명 확인"
 CALLER_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 if [[ "${CALLER_ACCOUNT}" != "${ACCOUNT_ID}" ]]; then
-  echo "❌ 현재 자격증명 계정(${CALLER_ACCOUNT})이 PoC 계정(${ACCOUNT_ID})과 다릅니다." >&2
+  echo "❌ 현재 자격증명 계정(${CALLER_ACCOUNT})이 대상 계정(${ACCOUNT_ID})과 다릅니다." >&2
   echo "   AWS_PROFILE 을 ${ACCOUNT_ID} 계정으로 설정 후 다시 실행하세요." >&2
   exit 1
 fi
 echo "✅ account=${CALLER_ACCOUNT}"
+
+# ---------------------------------------------------------------------------
+# 0.5 네트워크 이름 → ID 해석
+#     settings_local의 ECS_SUBNET_IDS / ECS_SECURITY_GROUP_ID 는 ID 또는 이름을 받는다.
+#       - sg-* / subnet-* 접두사면 ID로 간주하고 그대로 사용
+#       - 그 외는 이름으로 보고 조회: SG는 group-name(없으면 tag:Name), 서브넷은 tag:Name
+#     모호성 방지: 먼저 SG를 해석해 VPC를 확정하고, 서브넷 이름 조회를 그 VPC로 한정한다.
+#     서브넷 이름은 와일드카드(예: eb_private_*)를 허용한다.
+# ---------------------------------------------------------------------------
+log "네트워크 이름 → ID 해석"
+
+# SG 해석
+if [[ "${SG_SPEC}" == sg-* ]]; then
+  SG_ID="${SG_SPEC}"
+else
+  SG_ID="$(aws ec2 describe-security-groups \
+    --filters "Name=group-name,Values=${SG_SPEC}" \
+    --query 'SecurityGroups[].GroupId' --output text)"
+  if [[ -z "${SG_ID}" || "${SG_ID}" == "None" ]]; then
+    SG_ID="$(aws ec2 describe-security-groups \
+      --filters "Name=tag:Name,Values=${SG_SPEC}" \
+      --query 'SecurityGroups[].GroupId' --output text)"
+  fi
+  SG_N="$(printf '%s' "${SG_ID}" | wc -w | tr -d ' ')"
+  if [[ "${SG_N}" -eq 0 ]]; then
+    echo "❌ 보안그룹 '${SG_SPEC}' 를 group-name/tag:Name 으로 찾을 수 없습니다." >&2; exit 1
+  elif [[ "${SG_N}" -gt 1 ]]; then
+    echo "❌ 보안그룹 '${SG_SPEC}' 가 여러 개 매칭됩니다(${SG_ID}). ID(sg-...)로 지정하세요." >&2; exit 1
+  fi
+fi
+
+# SG의 VPC 확정(서브넷 이름 조회 범위 한정용)
+VPC_ID="$(aws ec2 describe-security-groups --group-ids "${SG_ID}" \
+  --query 'SecurityGroups[0].VpcId' --output text)"
+
+# 서브넷 해석 (CSV; 각 토큰이 ID면 그대로, 이름이면 tag:Name 조회 — 와일드카드 허용)
+RESOLVED_SUBNETS=()
+IFS=',' read -ra _SUBNET_TOKENS <<< "${SUBNET_SPEC}"
+for _tok in "${_SUBNET_TOKENS[@]}"; do
+  _tok="$(printf '%s' "${_tok}" | xargs)"   # 공백 트림
+  [[ -z "${_tok}" ]] && continue
+  if [[ "${_tok}" == subnet-* ]]; then
+    RESOLVED_SUBNETS+=("${_tok}")
+    continue
+  fi
+  _ids="$(aws ec2 describe-subnets \
+    --filters "Name=tag:Name,Values=${_tok}" "Name=vpc-id,Values=${VPC_ID}" \
+    --query 'Subnets[].SubnetId' --output text)"
+  if [[ -z "${_ids}" || "${_ids}" == "None" ]]; then
+    echo "❌ 서브넷 이름 '${_tok}' (vpc=${VPC_ID}) 에 매칭되는 서브넷이 없습니다." >&2; exit 1
+  fi
+  for _i in ${_ids}; do RESOLVED_SUBNETS+=("${_i}"); done
+done
+if [[ "${#RESOLVED_SUBNETS[@]}" -eq 0 ]]; then
+  echo "❌ ECS_SUBNET_IDS 해석 결과가 비었습니다: '${SUBNET_SPEC}'" >&2; exit 1
+fi
+# 중복 제거(순서 보존) 후 CSV 조립
+SUBNET_IDS="$(printf '%s\n' "${RESOLVED_SUBNETS[@]}" | awk '!seen[$0]++' | paste -sd, -)"
+
+echo "  SG     ${SG_SPEC} → ${SG_ID} (vpc=${VPC_ID})"
+echo "  subnet ${SUBNET_SPEC} → ${SUBNET_IDS}"
 
 # ---------------------------------------------------------------------------
 # 1. ECR 이미지 빌드 & 푸시 (ARM64, 태그 latest)
@@ -161,26 +241,47 @@ fi
 
 # ---------------------------------------------------------------------------
 # 2. S3 workspace 버킷
+#    이미 있으면(본 계정 소유든 타 계정 소유든) 생성을 건너뛴다.
+#      - head-bucket 200      → 접근 가능(본 계정 소유 가정) → 생성 skip, 버킷설정 적용
+#      - create BucketAlreadyOwnedByYou → 본 계정 소유 → skip, 버킷설정 적용
+#      - create BucketAlreadyExists     → 타 계정 소유(공유 버킷) → 생성/설정 모두 skip(소유 계정이 관리)
 # ---------------------------------------------------------------------------
 log "S3 workspace 버킷: ${WORKSPACE_BUCKET}"
+WORKSPACE_BUCKET_OWNED=0
 if aws s3api head-bucket --bucket "${WORKSPACE_BUCKET}" 2>/dev/null; then
-  echo "이미 존재 — 건너뜀"
+  echo "이미 존재(접근 가능) — 생성 건너뜀"
+  WORKSPACE_BUCKET_OWNED=1
 else
-  aws s3api create-bucket \
-    --bucket "${WORKSPACE_BUCKET}" \
-    --create-bucket-configuration "LocationConstraint=${AWS_REGION}" >/dev/null
+  if CREATE_ERR="$(aws s3api create-bucket \
+        --bucket "${WORKSPACE_BUCKET}" \
+        --create-bucket-configuration "LocationConstraint=${AWS_REGION}" 2>&1)"; then
+    echo "생성 완료"
+    WORKSPACE_BUCKET_OWNED=1
+  elif printf '%s' "${CREATE_ERR}" | grep -q 'BucketAlreadyOwnedByYou'; then
+    echo "이미 존재(본 계정 소유) — 건너뜀"
+    WORKSPACE_BUCKET_OWNED=1
+  elif printf '%s' "${CREATE_ERR}" | grep -q 'BucketAlreadyExists'; then
+    echo "⚠️ '${WORKSPACE_BUCKET}' 는 다른 계정이 소유한 버킷입니다 — 생성/버킷설정을 건너뜁니다(공유 버킷으로 가정)." >&2
+    echo "   봇/워커가 이 버킷을 read/write 하려면 소유 계정의 버킷 정책이 op 계정(${ACCOUNT_ID})을 허용해야 합니다." >&2
+  else
+    echo "${CREATE_ERR}" >&2
+    exit 1
+  fi
+fi
+
+if [[ "${WORKSPACE_BUCKET_OWNED}" == "1" ]]; then
   aws s3api put-public-access-block --bucket "${WORKSPACE_BUCKET}" \
     --public-access-block-configuration \
     "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+  # lifecycle: runs/*(prompt·input)와 jobs/*(done·cancel 멱등 마커)를 1일 후 만료(코드 없는 청소).
+  aws s3api put-bucket-lifecycle-configuration --bucket "${WORKSPACE_BUCKET}" \
+    --lifecycle-configuration '{
+      "Rules": [
+        {"ID": "expire-runs", "Filter": {"Prefix": "runs/"}, "Status": "Enabled", "Expiration": {"Days": 1}},
+        {"ID": "expire-jobs", "Filter": {"Prefix": "jobs/"}, "Status": "Enabled", "Expiration": {"Days": 1}}
+      ]
+    }'
 fi
-# lifecycle: runs/*(prompt·input)와 jobs/*(done·cancel 멱등 마커)를 1일 후 만료(코드 없는 청소).
-aws s3api put-bucket-lifecycle-configuration --bucket "${WORKSPACE_BUCKET}" \
-  --lifecycle-configuration '{
-    "Rules": [
-      {"ID": "expire-runs", "Filter": {"Prefix": "runs/"}, "Status": "Enabled", "Expiration": {"Days": 1}},
-      {"ID": "expire-jobs", "Filter": {"Prefix": "jobs/"}, "Status": "Enabled", "Expiration": {"Days": 1}}
-    ]
-  }'
 
 # ---------------------------------------------------------------------------
 # 3. IAM 역할
@@ -299,30 +400,10 @@ log "ECS 클러스터: ${CLUSTER}"
 aws ecs create-cluster --cluster-name "${CLUSTER}" >/dev/null
 echo "✅ cluster ready"
 
-# ---------------------------------------------------------------------------
-# 6. 네트워크 — 기본 VPC + 퍼블릭 서브넷 + 보안그룹
-# ---------------------------------------------------------------------------
-log "기본 VPC / 퍼블릭 서브넷 탐지"
-VPC_ID="$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true \
-  --query 'Vpcs[0].VpcId' --output text)"
-if [[ -z "${VPC_ID}" || "${VPC_ID}" == "None" ]]; then
-  echo "❌ 기본 VPC를 찾을 수 없습니다. ECS_SUBNET_IDS/ECS_SECURITY_GROUP_ID를 수동 지정하세요." >&2
-  exit 1
+# (네트워크는 위 0.5에서 settings_local의 ID/이름을 ID로 해석해 SG_ID/SUBNET_IDS/VPC_ID 확정)
+if [[ "${ASSIGN_PUBLIC_IP}" == "DISABLED" ]]; then
+  echo "  ↳ assignPublicIp=DISABLED(프라이빗 서브넷) — ECR/S3/SQS/SSM/Logs/Anthropic 아웃바운드용 NAT(또는 VPC 엔드포인트)가 있어야 함"
 fi
-SUBNET_IDS="$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=${VPC_ID}" \
-  --query 'Subnets[].SubnetId' --output text | tr '\t' ',')"
-echo "VPC=${VPC_ID} subnets=${SUBNET_IDS}"
-
-log "보안그룹: ${SG_NAME} (egress all)"
-SG_ID="$(aws ec2 describe-security-groups \
-  --filters "Name=group-name,Values=${SG_NAME}" "Name=vpc-id,Values=${VPC_ID}" \
-  --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)"
-if [[ -z "${SG_ID}" || "${SG_ID}" == "None" ]]; then
-  SG_ID="$(aws ec2 create-security-group --group-name "${SG_NAME}" \
-    --description 'tabris fargate sandbox PoC (egress only)' \
-    --vpc-id "${VPC_ID}" --query 'GroupId' --output text)"
-fi
-echo "SG=${SG_ID}"
 
 # ---------------------------------------------------------------------------
 # 6.5 SQS FIFO 큐 + DLQ (워밍 풀 디스패치)
@@ -352,6 +433,51 @@ JSON
 )" \
   --query 'QueueUrl' --output text)"
 echo "QUEUE=${QUEUE_URL}"
+
+# ---------------------------------------------------------------------------
+# 6.6 봇 EB role 디스패치 권한 부착
+#     봇(run_server.py)은 EB 인스턴스 role로 구동되며 SQS 적재·workspace 업로드·취소(StopTask)를
+#     수행한다. 기존 role(${BOT_ROLE_NAME})에 디스패치 전용 인라인 정책을 부착한다.
+#     ※ 기존 운영 role을 수정하는 단계다. role이 없으면 경고만 남기고 계속 진행한다.
+# ---------------------------------------------------------------------------
+log "봇 EB role 디스패치 권한 부착: ${BOT_ROLE_NAME} (sqs:SendMessage / s3:PutObject / ecs:StopTask)"
+if aws iam get-role --role-name "${BOT_ROLE_NAME}" >/dev/null 2>&1; then
+  BOT_POLICY="$(cat <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DispatchToSandboxQueue",
+      "Effect": "Allow",
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:${QUEUE_NAME}"
+    },
+    {
+      "Sid": "PutWorkspacePromptAndMarkers",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::${WORKSPACE_BUCKET}/runs/*",
+        "arn:aws:s3:::${WORKSPACE_BUCKET}/jobs/*"
+      ]
+    },
+    {
+      "Sid": "CancelSandboxTask",
+      "Effect": "Allow",
+      "Action": "ecs:StopTask",
+      "Resource": "arn:aws:ecs:${AWS_REGION}:${ACCOUNT_ID}:task/${CLUSTER}/*"
+    }
+  ]
+}
+JSON
+)"
+  aws iam put-role-policy --role-name "${BOT_ROLE_NAME}" \
+    --policy-name tabris-bot-dispatch --policy-document "${BOT_POLICY}"
+  echo "  ✓ ${BOT_ROLE_NAME} 에 tabris-bot-dispatch 인라인 정책 부착"
+else
+  echo "  ⚠️ EB role '${BOT_ROLE_NAME}' 를 찾을 수 없어 권한 부착을 건너뜁니다." >&2
+  echo "     BOT_ROLE_NAME 으로 올바른 role 이름을 지정해 다시 실행하세요(봇이 디스패치 못 함)." >&2
+fi
 
 # ---------------------------------------------------------------------------
 # 6.7 SSM Parameter Store — 시크릿 적재(SecureString). task def secrets가 이 값을 참조한다.
@@ -399,7 +525,7 @@ aws ecs put-cluster-capacity-providers --cluster "${CLUSTER}" \
   --capacity-providers FARGATE FARGATE_SPOT \
   --default-capacity-provider-strategy capacityProvider=FARGATE_SPOT,weight=1 >/dev/null
 
-NET_CONF="awsvpcConfiguration={subnets=[${SUBNET_IDS}],securityGroups=[${SG_ID}],assignPublicIp=ENABLED}"
+NET_CONF="awsvpcConfiguration={subnets=[${SUBNET_IDS}],securityGroups=[${SG_ID}],assignPublicIp=${ASSIGN_PUBLIC_IP}}"
 
 log "ECS Service: ${SERVICE_NAME} (desiredCount=0 — 스케줄드/오토스케일이 조절)"
 SVC_STATUS="$(aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE_NAME}" \
@@ -499,7 +625,8 @@ aws application-autoscaling put-scheduled-action \
 # 8. 결과 출력 + settings_local 스니펫
 # ---------------------------------------------------------------------------
 cat > "${ENV_OUT}" <<ENV
-# run_create_poc.sh 생성 결과 (생성 시점 스냅샷). run_terminate_poc.sh 가 참고한다.
+# run_create.sh 생성 결과 (생성 시점 스냅샷). run_terminate.sh 가 참고한다.
+# SUBNET_IDS / SG_ID 는 settings_local.py에서 읽은 기존 리소스이며 terminate가 삭제하지 않는다.
 AWS_REGION=${AWS_REGION}
 ACCOUNT_ID=${ACCOUNT_ID}
 WORKSPACE_BUCKET=${WORKSPACE_BUCKET}
@@ -507,11 +634,12 @@ CLUSTER=${CLUSTER}
 TASK_FAMILY=${TASK_FAMILY}
 TASK_ROLE_NAME=${TASK_ROLE_NAME}
 EXEC_ROLE_NAME=${EXEC_ROLE_NAME}
+BOT_ROLE_NAME=${BOT_ROLE_NAME}
 LOG_GROUP=${LOG_GROUP}
-SG_NAME=${SG_NAME}
-SG_ID=${SG_ID}
 VPC_ID=${VPC_ID}
+SG_ID=${SG_ID}
 SUBNET_IDS=${SUBNET_IDS}
+ASSIGN_PUBLIC_IP=${ASSIGN_PUBLIC_IP}
 IMAGE_TAG=${IMAGE_TAG}
 SERVICE_NAME=${SERVICE_NAME}
 QUEUE_NAME=${QUEUE_NAME}
@@ -524,7 +652,7 @@ log "완료 ✅  생성 정보 → ${ENV_OUT}"
 cat <<SNIPPET
 
 ────────────────────────────────────────────────────────────────────
-settings_local.py 에 아래를 반영하고 봇을 재시작하세요 (Vagrant):
+settings_local.py 의 아래 값이 생성 결과와 일치하는지 확인하고 봇을 재시작하세요:
 
 WORKSPACE_S3_BUCKET = '${WORKSPACE_BUCKET}'
 ECS_CLUSTER = '${CLUSTER}'      # 취소(StopTask)에 사용
@@ -532,10 +660,10 @@ ECS_CLUSTER = '${CLUSTER}'      # 취소(StopTask)에 사용
 # 워밍 풀 디스패치 큐. 필수 — 비어 있으면 봇이 기동을 거부한다.
 SQS_QUEUE_URL = '${QUEUE_URL}'
 
-※ 봇은 aws CLI만 사용하므로 추가 pip 설치가 필요 없습니다.
-   단, 봇 IAM(인스턴스 role 또는 hbsmith-dv)에 아래 권한이 있어야 합니다:
+※ 봇 EB role(${BOT_ROLE_NAME})에는 본 스크립트가 디스패치 권한(tabris-bot-dispatch)을 부착했습니다:
      - sqs:SendMessage  → ${QUEUE_NAME}
      - s3:PutObject     → ${WORKSPACE_BUCKET}/jobs/* (cancel 마커), runs/* (prompt/input)
-   워커(task role)에는 본 스크립트가 SQS receive/delete/visibility 권한을 부여했습니다.
+     - ecs:StopTask     → cluster ${CLUSTER}
+   워커(task role)에는 SQS receive/delete/visibility 권한을 부여했습니다.
 ────────────────────────────────────────────────────────────────────
 SNIPPET

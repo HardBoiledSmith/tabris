@@ -92,7 +92,7 @@ PROGRESS_INTERVAL_SEC = 10
 # SQS FIFO를 소비하는 상주 루프의 대상 큐. 필수 — 비어 있으면 기동을 거부한다.
 TABRIS_QUEUE_URL = os.environ.get('TABRIS_QUEUE_URL', '')
 # 격리·위생을 위해 워커를 오래 재활용하지 않는다: 둘 중 먼저 도달하는 쪽에서 은퇴(exit 0)한다.
-MAX_JOBS = int(os.environ.get('MAX_JOBS', '2'))
+MAX_JOBS = int(os.environ.get('MAX_JOBS', '1'))
 MAX_LIFETIME_SEC = int(os.environ.get('MAX_LIFETIME_SEC', '2700'))  # 45분
 # 메시지 visibility: 처리 중 하트비트로 주기 연장. 거대 정적값 대신 모더릿 + 연장으로
 # 워커 급사 시 빠른 재배달을 노린다.
