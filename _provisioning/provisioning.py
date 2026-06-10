@@ -150,14 +150,14 @@ def main():
     _print_line_number()
 
     settings_src_real = '/vagrant/configuration/etc/tabris/settings_local.py'
-    settings_src_example = '/vagrant/configuration/etc/tabris/settings_local.py.example'
+    settings_src_sample = '/vagrant/configuration/etc/tabris/settings_local_sample.py'
     settings_dst = '/etc/tabris/settings_local.py'
     if os.path.exists(settings_src_real):
         _run(['cp', '--backup', settings_src_real, settings_dst])
     else:
-        print('WARNING: settings_local.py not found in configuration; copying .example as placeholder.')
+        print('WARNING: settings_local.py not found in configuration; copying sample as placeholder.')
         print('         Fill in /etc/tabris/settings_local.py on the VM before starting tabris.service.')
-        _run(['cp', '--backup', settings_src_example, settings_dst])
+        _run(['cp', '--backup', settings_src_sample, settings_dst])
     _run(['chmod', '600', settings_dst])
     _run(['chown', 'root:root', settings_dst])
 

@@ -4,11 +4,11 @@ Slack Bolt (Socket Mode) 기반 봇. 사용자의 멘션/DM에 응답하여 **EC
 
 ## 구성
 
-- `run_server.py` — Slack Bolt 앱(Socket Mode). 이벤트 수신 시 잡을 **SQS FIFO 큐**에 적재한다(워밍 풀). `SQS_QUEUE_URL` 미설정 시 레거시로 ECS RunTask를 직접 호출한다.
-- `sandbox_worker.py` — Fargate 샌드박스 워커. 워밍 풀 모드에선 SQS를 long-poll 하며 잡을 처리하고, 일정 사용량/수명마다 스스로 은퇴(ECS가 교체)한다. 큐 미설정 시 RunTask로 1건 처리 후 종료.
+- `run_server.py` — Slack Bolt 앱(Socket Mode). 이벤트 수신 시 잡을 **SQS FIFO 큐**에 적재한다(워밍 풀). `SQS_QUEUE_URL`은 필수 — 미설정 시 기동을 거부한다.
+- `sandbox_worker.py` — Fargate 샌드박스 워커. SQS를 long-poll 하며 잡을 처리하고, 일정 사용량/수명마다 스스로 은퇴(ECS가 교체)한다. `TABRIS_QUEUE_URL` 필수.
 - `tabris_slack_utils.py` — Slack 게시(Block Kit 변환)·아티팩트 업로드 등 봇/워커 공용 유틸.
 - `Dockerfile` — Fargate 샌드박스 이미지(`hbsmith/tabris`). `python:3.12-slim` 위에 node20 + `@anthropic-ai/claude-code` + aws CLI를 올린 런타임. ECR로 푸시해 사용.
-- `_provisioning/fargate/` — SQS·ECS 클러스터/서비스(워밍 풀)·오토스케일·IAM·태스크 정의 생성/삭제 스크립트(`run_create.sh` / `run_terminate.sh`).
+- `_provisioning/fargate/` — SQS·ECS 클러스터/서비스(워밍 풀)·오토스케일·IAM·태스크 정의 프로비저닝 스크립트(`run_create.sh` 신규 생성 / `run_update.sh` 기존 리소스 갱신 / `run_terminate.sh` 정리).
 - `_provisioning/` — 봇을 돌리는 Vagrant VM 프로비저닝. 상세는 아래 섹션.
 
 ### 디스패치 아키텍처 (워밍 풀)
@@ -19,9 +19,8 @@ Slack Bolt (Socket Mode) 기반 봇. 사용자의 멘션/DM에 응답하여 **EC
 2. **ECS Service**(Fargate Spot)로 떠 있는 워커(`sandbox_worker.py`)가 큐를 소비해 Claude 실행 후 결과를 Slack에 게시한다.
 3. 워커는 잡 경계마다 workspace를 비우고(유저 간 격리), `MAX_JOBS`/`MAX_LIFETIME_SEC`마다 은퇴 → ECS가 새 태스크로 교체(오래 재활용하지 않음).
 4. 멱등/취소는 S3 마커(`jobs/{job_id}/done`·`cancel`)로 처리(DynamoDB 미사용). 취소는 마커를 먼저 쓰고 `StopTask` 한다(좀비 재실행 방지).
-5. 오토스케일(step scaling): 대기 메시지가 생기면 워커를 늘리고(0→N), 백로그가 비면 0으로 복귀. 업무시간엔 warm 1대를 유지한다(스케줄드 floor).
-
-`SQS_QUEUE_URL`을 비우면 레거시 1회용 RunTask 경로로 동작한다(롤백 안전망).
+5. 오토스케일(step scaling): 대기 메시지가 생기면 워커를 늘리고(0→최대 5대), 백로그(대기+처리중)가 5분간 비면 0으로 복귀. 평일 09–19시 KST엔 스케줄드 floor(min=1)로 warm 워커 1대를 유지하고, 야간/주말엔 0대까지 비운다(비용 절감).
+6. 신뢰성: 워커가 메시지 수신~삭제 전 구간 동안 백그라운드 스레드로 SQS visibility를 주기 연장(하트비트)해, 긴 잡 처리 중 중복 재배달을 막는다. 워커가 급사하면 visibility 만료 후 재배달=재시도되고, 반복 실패 메시지는 DLQ(`tabris-sandbox-jobs-dlq.fifo`)로 빠진다. 송신 측은 `MessageDeduplicationId=job_id`로 5분 내 중복 적재를 차단한다.
 
 ## 1. Slack App 설정 (최초 1회)
 
@@ -106,13 +105,15 @@ Slack Bolt (Socket Mode) 기반 봇. 사용자의 멘션/DM에 응답하여 **EC
 
 ```bash
 python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+pip install -r _provisioning/requirements.txt
 
-cp .env.example .env
-# → SLACK_BOT_TOKEN, SLACK_APP_TOKEN, BOT_USER_ID, ANTHROPIC_API_KEY 채우기
+# 설정은 .env가 아니라 settings_local.py 모듈로 로드된다. 샘플을 저장소 루트에 복사해 채운다.
+cp _provisioning/configuration/etc/tabris/settings_local_sample.py settings_local.py
+# → SLACK_BOT_TOKEN, SLACK_APP_TOKEN, BOT_USER_ID, ANTHROPIC_API_KEY,
+#   SQS_QUEUE_URL·ECS_*·WORKSPACE_S3_BUCKET 등 채우기
 
-# 봇만 로컬에서 Socket Mode로 띄운다. 샌드박스 실행은 ECS Fargate(SQS 워밍 풀 또는 RunTask)가
-# 담당하므로, settings_local에 ECS_*·(선택)SQS_QUEUE_URL과 AWS 자격증명이 필요하다.
+# 봇만 로컬에서 Socket Mode로 띄운다. 샌드박스 실행은 ECS Fargate(SQS 워밍 풀)가
+# 담당하므로, settings_local에 ECS_*·SQS_QUEUE_URL(필수)과 AWS 자격증명이 필요하다.
 python run_server.py
 ```
 
@@ -125,7 +126,7 @@ python run_server.py
 
 ### ① 토큰 설정
 ```bash
-cp _provisioning/configuration/etc/tabris/settings_local.py.example \
+cp _provisioning/configuration/etc/tabris/settings_local_sample.py \
    _provisioning/configuration/etc/tabris/settings_local.py
 # → SLACK_*, BOT_USER_ID, ANTHROPIC_API_KEY 채우기
 ```
@@ -159,9 +160,9 @@ vagrant ssh -c 'cd /opt/tabris && sudo git pull && sudo systemctl restart tabris
 # provisioning.py 자체가 바뀐 경우
 vagrant provision
 
-# 샌드박스 이미지(Dockerfile/스킬/워커) 변경 반영 — ECR 빌드·푸시 + task def 갱신 + 풀 서비스 업데이트.
+# 샌드박스 이미지(Dockerfile/스킬/워커) 변경 반영 — ECR 빌드·푸시 + task def 갱신 + 풀 서비스 롤링.
 # (봇 호스트가 아니라 ECR/ECS에 반영된다. AWS_PROFILE은 해당 계정으로.)
-cd _provisioning/fargate && AWS_PROFILE=<acct-profile> ./run_create.sh
+cd _provisioning/fargate && AWS_PROFILE=<acct-profile> ./run_update.sh image deploy
 ```
 
 ### ⑥ 종료 / 정리
@@ -183,14 +184,14 @@ vagrant destroy -f     # VM 완전 삭제
 | `MAX_WORKERS` |   | `5` | 봇 이벤트 동시 처리 스레드 수 |
 | `MEMORY_S3_BUCKET` |   | `hbsmith-tabris-memory` | 사용자별 memory S3 버킷명. **빈 문자열이면 S3 sync 기능 비활성화** (로컬·Vagrant) |
 | `WORKSPACE_S3_BUCKET` | ✓ | — | prompt/입력·멱등 마커(`jobs/`)용 버킷 |
-| `SQS_QUEUE_URL` |   | `''` | 워밍 풀 디스패치 큐(FIFO). **빈 문자열이면 레거시 RunTask 경로** |
+| `SQS_QUEUE_URL` | ✓ | — | 워밍 풀 디스패치 큐(FIFO). 미설정 시 봇이 기동을 거부한다 |
 | `ECS_CLUSTER` / `ECS_SANDBOX_TASK_DEFINITION` / `ECS_SUBNET_IDS` / `ECS_SECURITY_GROUP_ID` / `ECS_ASSIGN_PUBLIC_IP` | ✓ | — | Fargate 디스패치 설정. `run_create.sh`가 **기본 VPC를 탐지하지 않고** 이 서브넷/SG/퍼블릭IP 값으로 워밍 풀을 배치한다. 서브넷/SG는 **ID(`subnet-*`/`sg-*`) 또는 이름**(서브넷=tag:Name·와일드카드 허용, SG=group-name)으로 지정 — 이름이면 스크립트가 SG의 VPC 안에서 ID로 해석한다 |
 
 VM에서는 `/etc/tabris/settings_local.py`에 Python 상수로 정의한다. 샘플은 `_provisioning/configuration/etc/tabris/settings_local_sample.py` 참고. 로컬 개발 시에도 동일하게 `settings_local`를 import할 수 있는 경로에 두면 된다.
 
 > 운영 배포는 op 계정(187063173014)을 가리키는 자격증명으로 실행한다. 이미지는 공유 계정(591379657681) ECR repo에 cross-account push/pull한다. `ECS_ASSIGN_PUBLIC_IP=DISABLED`(프라이빗 서브넷)인 경우 ECR/S3/SQS/SSM/Logs/Anthropic 아웃바운드를 위해 해당 서브넷에 **NAT(또는 VPC 엔드포인트)**가 있어야 한다. `run_create.sh`는 봇 EB role(`tabris-test-ec2-role`)에 디스패치 권한(`sqs:SendMessage`·workspace `s3:PutObject`·`ecs:StopTask`)을 인라인 정책 `tabris-bot-dispatch`로 자동 부착한다.
 >
-> 워커(샌드박스) 쪽 튜닝값 `MAX_JOBS`(기본 2)·`MAX_LIFETIME_SEC`(2700)·`SQS_VISIBILITY_TIMEOUT_SEC`(360)는 **Fargate 태스크 정의의 env**로 주입된다(`_provisioning/fargate/task_definition_sandbox.json`, `run_create.sh`가 치환).
+> 워커(샌드박스) 쪽 튜닝값 `MAX_JOBS`(기본 1)·`MAX_LIFETIME_SEC`(2700)·`SQS_VISIBILITY_TIMEOUT_SEC`(360)는 **Fargate 태스크 정의의 env**로 주입된다(`_provisioning/fargate/task_definition_sandbox.json`, `run_create.sh`가 치환).
 >
 > 시크릿(`ANTHROPIC_API_KEY`·`SLACK_BOT_TOKEN`·`NERV_MCP_TOKEN`·`ATLASSIAN_ROVO_MCP_TOKEN`·`GITHUB_PAT`·`SENTRY_AUTH_TOKEN`)은 평문 env가 아니라 **SSM Parameter Store(SecureString, `/tabris/sandbox/*`)**에 저장하고, 태스크 정의의 `secrets` 블록이 `valueFrom`으로 참조한다. `run_create.sh`가 `settings_local.py`에서 읽어 SSM에 적재하고 execution role에 읽기 권한을 부여하므로, 콘솔/`describe-task-definition`/RunTask 호출 어디에도 평문이 노출되지 않는다. 키 회전 시 SSM 값만 갱신 후 새 태스크가 뜨면 반영된다.
 
