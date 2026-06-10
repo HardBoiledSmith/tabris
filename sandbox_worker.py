@@ -86,6 +86,7 @@ MEMORY_DIR = os.path.join(PROJECT_DIR, 'memory')
 CLAUDE_CONFIG = '/home/claude/.claude.json'
 
 CLAUDE_TIMEOUT = int(os.environ.get('CLAUDE_TIMEOUT', '1800'))
+CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'claude-opus-4-8')
 WORKSPACE_S3_BUCKET = os.environ.get('WORKSPACE_S3_BUCKET', '')
 MEMORY_S3_BUCKET = os.environ.get('MEMORY_S3_BUCKET', '')
 
@@ -368,6 +369,8 @@ def run_claude_direct(prompt: str, progress_callback) -> tuple[int, str, dict | 
         'claude',
         '-p',
         prompt,
+        '--model',
+        CLAUDE_MODEL,
         '--mcp-config',
         CLAUDE_CONFIG,
         '--dangerously-skip-permissions',
