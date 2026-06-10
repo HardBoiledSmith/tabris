@@ -140,6 +140,19 @@ python scripts/download_files.py \
   --output-dir ./downloads/
 ```
 
+To fetch a single file directly by its `url_private(_download)` (no messages JSON):
+
+```bash
+python scripts/download_files.py \
+  --token $SLACK_BOT_TOKEN \
+  --url 'https://files.slack.com/files-pri/...' \
+  --name report.pdf \
+  --output-dir /tmp
+```
+
+`--url` and `--input` are mutually exclusive. The script exits non-zero if any download
+fails; a 404 means the file was deleted or is inaccessible (ask the user to re-upload it).
+
 ## Error Reference
 
 See `references/errors.md` for common Slack API errors and how to fix them.

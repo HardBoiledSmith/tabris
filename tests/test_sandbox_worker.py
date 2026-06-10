@@ -98,18 +98,57 @@ def test_self_task_arn_none_without_metadata(monkeypatch):
     assert sandbox_worker._self_task_arn() is None
 
 
-def test_download_inputs_from_s3(monkeypatch, tmp_path):
-    monkeypatch.setattr(sandbox_worker, 'WORKSPACE_S3_BUCKET', 'wb')
+def test_download_input_files_from_slack(monkeypatch, tmp_path):
+    """현행 포맷({filename,url})은 Slack에서 Bearer 토큰으로 직접 받는다."""
     monkeypatch.setattr(sandbox_worker, 'INPUT_DIR', str(tmp_path))
-    calls = []
-    monkeypatch.setattr(sandbox_worker.subprocess, 'run', lambda cmd, **k: calls.append(cmd))
+    monkeypatch.setenv('SLACK_BOT_TOKEN', 'xoxb-test')
+    seen = []
 
-    saved = sandbox_worker.download_inputs_from_s3(
-        [{'filename': 'a.txt', 's3_key': 'runs/TS/input/a.txt'}]
-    )
+    def fake_read(url, token, max_bytes):
+        seen.append((url, token))
+        return b'hello'
+
+    monkeypatch.setattr(sandbox_worker, '_read_slack_private_url', fake_read)
+
+    saved = sandbox_worker.download_input_files([{'filename': 'a.txt', 'url': 'https://files.slack.com/a', 'size': 5}])
 
     assert saved == ['a.txt']
-    assert any('s3://wb/runs/TS/input/a.txt' in c for c in calls)
+    assert seen == [('https://files.slack.com/a', 'xoxb-test')]
+    assert (tmp_path / 'a.txt').read_bytes() == b'hello'
+
+
+def test_download_input_files_sanitizes_filename(monkeypatch, tmp_path):
+    """SQS body의 악성 filename은 워커에서 한 번 더 sanitize해 경로 탈출을 막는다."""
+    monkeypatch.setattr(sandbox_worker, 'INPUT_DIR', str(tmp_path))
+    monkeypatch.setenv('SLACK_BOT_TOKEN', 'xoxb-test')
+    monkeypatch.setattr(sandbox_worker, '_read_slack_private_url', lambda url, token, mx: b'x')
+
+    saved = sandbox_worker.download_input_files(
+        [{'filename': '../../etc/evil', 'url': 'https://files.slack.com/e', 'size': 1}]
+    )
+
+    assert saved == ['evil']
+    assert (tmp_path / 'evil').exists()
+
+
+def test_download_input_files_continues_on_failure(monkeypatch, tmp_path):
+    """한 파일 다운로드가 실패해도 나머지는 계속 받는다."""
+    monkeypatch.setattr(sandbox_worker, 'INPUT_DIR', str(tmp_path))
+    monkeypatch.setenv('SLACK_BOT_TOKEN', 'xoxb-test')
+
+    def fake_read(url, token, mx):
+        return None if url.endswith('bad') else b'ok'
+
+    monkeypatch.setattr(sandbox_worker, '_read_slack_private_url', fake_read)
+
+    saved = sandbox_worker.download_input_files(
+        [
+            {'filename': 'bad.txt', 'url': 'https://files.slack.com/bad', 'size': 1},
+            {'filename': 'good.txt', 'url': 'https://files.slack.com/good', 'size': 1},
+        ]
+    )
+
+    assert saved == ['good.txt']
 
 
 def test_process_job_emits_request_and_response_events(monkeypatch, event_log_lines):
@@ -129,7 +168,7 @@ def test_process_job_emits_request_and_response_events(monkeypatch, event_log_li
     monkeypatch.setattr(sandbox_worker, 'WebClient', lambda token: MagicMock())
     monkeypatch.setattr(sandbox_worker.os, 'makedirs', lambda *a, **k: None)
     monkeypatch.setattr(sandbox_worker, 'download_prompt_from_s3', lambda key: 'p')
-    monkeypatch.setattr(sandbox_worker, 'download_inputs_from_s3', lambda files: [])
+    monkeypatch.setattr(sandbox_worker, 'download_input_files', lambda files: [])
     monkeypatch.setattr(sandbox_worker, 'sync_memory_from_s3', lambda user: None)
     monkeypatch.setattr(sandbox_worker, 'sync_memory_to_s3', lambda user: None)
     monkeypatch.setattr(sandbox_worker, '_self_task_arn', lambda: None)

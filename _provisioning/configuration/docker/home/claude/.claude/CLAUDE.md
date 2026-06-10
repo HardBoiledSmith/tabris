@@ -43,6 +43,7 @@
 
 - **중간·임시 산출**(시험 출력, 캐시, 대용량 중간 결과 등)은 컨테이너 **`/tmp`** 아래에서만 작업할 것. (`/tmp`는 세션과 함께 비워지므로 Slack에 파일로 올라가지 않는다.)
 - 주인님이 이번 Slack 메시지와 함께 올린 첨부가 있으면, 봇이 컨테이너 **`/workspace/input/`** 에 복사해 둔다. 필요하면 이 경로에서 읽어 답변할 것. **최종 산출·봇이 Slack에 올릴 파일**은 기존과 같이 **`/workspace/output/`** 만 사용할 것.
+- **이 스레드의 과거 첨부**(이전 메시지에 올라왔던 파일, 봇이 과거에 올린 산출물 포함)는 프롬프트의 **「스레드의 과거 첨부」** 섹션에 파일명·메타·`url`로 나열된다. 이 파일들은 `/workspace/input/`에 미리 받아두지 않으므로, **필요한 것만** 다음 명령으로 **`/tmp`** 에 받아 활용할 것: `python ~/.claude/skills/slack_fetch/scripts/download_files.py --token $SLACK_BOT_TOKEN --url '<url>' --name '<name>' --output-dir /tmp`. 다운로드가 404 등으로 실패하면(파일이 Slack에서 삭제됐을 수 있음) 주인님께 해당 파일을 다시 올려달라고 안내할 것.
 - 질의에 필요한 문서가 **`/workspace/input/`에 없거나** 주인님이 이번에 첨부하지 않은 경우, 사내 참고 자료는 환경 변수 **`$DOCUMENTS_S3_BUCKET`** 에 지정된 버킷(`s3://$DOCUMENTS_S3_BUCKET`)에 있을 수 있다. 이때 **`aws_inspect`** 스킬의 절차를 따른다. 해당 버킷에 대한 목록·조회·다운로드는 스킬에 적힌 **read-only(Fast Path)** 범위만 사용하고, 다른 버킷·계정이나 쓰기·삭제 등은 스킬의 Role Chain·금지 규칙을 그대로 적용한다.
 - 주인님께 넘길 **최종 파일**(보고서·코드·보낸 데이터·첨부로 줄 바이너리 등)만 컨테이너 **`/workspace/output/`** 아래에 저장할 것. 봇은 **`/workspace/output/`** 만 Slack 파일 업로드 대상으로 수집한다. (`/workspace` 루트 등 다른 경로에 두면 업로드되지 않는다.)
 - **React/HTML 웹 아티팩트**(web-artifacts-builder로 빌드한 번들)는 `bundle.html` 생성 후 반드시 `bash scripts/upload-artifact.sh bundle.html`을 실행할 것. 스크립트가 S3 업로드 후 `https://tabris-artifacts.hbsmith.io/...` 형태의 공개 URL을 출력하면, 그 URL을 Slack 응답에 포함해 주인님이 브라우저에서 바로 열 수 있도록 한다. URL을 직접 조합하거나 추측하지 말 것.

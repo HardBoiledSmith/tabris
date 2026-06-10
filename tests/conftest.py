@@ -136,8 +136,6 @@ def dispatch_mock(monkeypatch):
     """봇의 SQS 디스패치(`_enqueue_claude_job`)를 MagicMock으로 대체해 호출 여부/인자만 검사한다."""
     mock = MagicMock(return_value='job-1')
     monkeypatch.setattr(run_server, '_enqueue_claude_job', mock)
-    # 첨부 S3 업로드도 외부 호출이므로 무력화(파일 없는 이벤트에선 어차피 호출 안 됨).
-    monkeypatch.setattr(run_server, '_upload_slack_files_to_s3', lambda event, thread_ts: [])
     return mock
 
 

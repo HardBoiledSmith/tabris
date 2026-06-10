@@ -15,7 +15,7 @@ Slack Bolt (Socket Mode) 기반 봇. 사용자의 멘션/DM에 응답하여 **EC
 
 봇은 요청마다 콜드 Fargate 태스크를 띄우는 대신(부팅 ~1분+), 상주 워커 풀에 잡을 넘긴다.
 
-1. 봇이 Slack 이벤트 수신 → 대기 메시지 게시 → prompt/입력을 S3에 올리고 **SQS FIFO**에 잡 적재. `MessageGroupId=user_id`로 같은 유저 잡을 직렬화한다(유저별 memory 레이스·풀 과점유 방지).
+1. 봇이 Slack 이벤트 수신 → 대기 메시지 게시 → prompt를 S3에 올리고 **SQS FIFO**에 잡 적재. `MessageGroupId=user_id`로 같은 유저 잡을 직렬화한다(유저별 memory 레이스·풀 과점유 방지). 첨부는 S3에 복사하지 않고 메타데이터(파일명·url)만 잡에 담는다 — 워커가 Slack에서 직접 받는다(현재 메시지 첨부는 `/workspace/input/`에 즉시, 스레드의 과거 첨부는 프롬프트 목록에서 에이전트가 필요할 때만 `slack_fetch` 스킬로).
 2. **ECS Service**(Fargate Spot)로 떠 있는 워커(`sandbox_worker.py`)가 큐를 소비해 Claude 실행 후 결과를 Slack에 게시한다.
 3. 워커는 잡 경계마다 workspace를 비우고(유저 간 격리), `MAX_JOBS`/`MAX_LIFETIME_SEC`마다 은퇴 → ECS가 새 태스크로 교체(오래 재활용하지 않음).
 4. 멱등/취소는 S3 마커(`jobs/{job_id}/done`·`cancel`)로 처리(DynamoDB 미사용). 취소는 마커를 먼저 쓰고 `StopTask` 한다(좀비 재실행 방지).
@@ -183,7 +183,7 @@ vagrant destroy -f     # VM 완전 삭제
 | `CLAUDE_TIMEOUT` |   | `1800` | Claude 실행 타임아웃(초) |
 | `MAX_WORKERS` |   | `5` | 봇 이벤트 동시 처리 스레드 수 |
 | `MEMORY_S3_BUCKET` |   | `hbsmith-tabris-memory` | 사용자별 memory S3 버킷명. **빈 문자열이면 S3 sync 기능 비활성화** (로컬·Vagrant) |
-| `WORKSPACE_S3_BUCKET` | ✓ | — | prompt/입력·멱등 마커(`jobs/`)용 버킷 |
+| `WORKSPACE_S3_BUCKET` | ✓ | — | prompt(`runs/`)·멱등 마커(`jobs/`)용 버킷. 첨부는 Slack 원본을 직접 받으므로 여기 올리지 않는다 |
 | `SQS_QUEUE_URL` | ✓ | — | 워밍 풀 디스패치 큐(FIFO). 미설정 시 봇이 기동을 거부한다 |
 | `ECS_CLUSTER` / `ECS_SANDBOX_TASK_DEFINITION` / `ECS_SUBNET_IDS` / `ECS_SECURITY_GROUP_ID` / `ECS_ASSIGN_PUBLIC_IP` | ✓ | — | Fargate 디스패치 설정. `run_create.sh`가 **기본 VPC를 탐지하지 않고** 이 서브넷/SG/퍼블릭IP 값으로 워밍 풀을 배치한다. 서브넷/SG는 **ID(`subnet-*`/`sg-*`) 또는 이름**(서브넷=tag:Name·와일드카드 허용, SG=group-name)으로 지정 — 이름이면 스크립트가 SG의 VPC 안에서 ID로 해석한다 |
 

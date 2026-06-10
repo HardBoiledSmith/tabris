@@ -10,6 +10,8 @@ import logging
 import os
 import re
 import stat
+import urllib.error
+import urllib.request
 
 from slack_markdown_parser import build_fallback_text_from_blocks
 from slack_markdown_parser import convert_markdown_to_slack_blocks
@@ -22,8 +24,10 @@ ARTIFACT_MAX_BYTES_PER_FILE = 1_073_741_824  # 1 GiB
 ARTIFACT_MAX_TOTAL_BYTES = 5_368_709_120  # 5 GiB
 # Slack 파일 업로드는 이 하위만 스캔한다. 중간 산출은 컨테이너 `/tmp` 등에 두도록 CLAUDE.md로 안내한다.
 WORKSPACE_OUTPUT_SUBDIR = 'output'
-# 트리거 메시지의 Slack 첨부만 호스트가 받아 컨테이너 `/workspace/input/`에 둔다.
+# 트리거 메시지의 Slack 첨부만 워커가 받아 컨테이너 `/workspace/input/`에 둔다.
 WORKSPACE_INPUT_SUBDIR = 'input'
+# 프롬프트에 나열하는 스레드 과거 첨부 개수 상한. 초과분(오래된 것부터)은 생략을 명시한다.
+THREAD_ATTACHMENTS_LIST_MAX = 50
 
 SLACK_MAX_BLOCKS_PER_MESSAGE = 50
 SLACK_MSG_REDIRECT_NOTICE = '메시지가 길어 새 글로 포스팅합니다.'
@@ -314,6 +318,44 @@ def post_workspace_artifacts_to_thread(client, channel: str, thread_ts: str, wor
                 logger.warning('files_upload_v2 failed for %s', rel_name, exc_info=True)
         except Exception:
             logger.warning('files_upload_v2 failed for %s', rel_name, exc_info=True)
+
+
+def _slack_private_file_url(file_obj: dict) -> str | None:
+    """Slack file 객체에서 Bot 토큰으로 GET 가능한 비공개 URL을 고른다."""
+
+    return file_obj.get('url_private_download') or file_obj.get('url_private')
+
+
+def _read_slack_private_url(url: str, bot_token: str, max_bytes: int) -> bytes | None:
+    """Slack `url_private*` GET. `max_bytes`를 넘기면 None."""
+
+    req = urllib.request.Request(
+        url,
+        headers={'Authorization': f'Bearer {bot_token}'},
+        method='GET',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            cl = resp.headers.get('Content-Length')
+            if cl is not None:
+                try:
+                    if int(cl) > max_bytes:
+                        logger.warning(
+                            'Skipping Slack attachment: Content-Length %s exceeds %d',
+                            cl,
+                            max_bytes,
+                        )
+                        return None
+                except ValueError:
+                    pass
+            data = resp.read(max_bytes + 1)
+    except (OSError, urllib.error.HTTPError, urllib.error.URLError) as exc:
+        logger.warning('Slack attachment download failed: %s', exc, exc_info=True)
+        return None
+    if len(data) > max_bytes:
+        logger.warning('Slack attachment exceeds max_bytes after read')
+        return None
+    return data
 
 
 def _sanitize_slack_attachment_filename(raw_name: str) -> str:

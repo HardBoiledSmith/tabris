@@ -17,8 +17,10 @@ from const import USER_ACCESS_DENIED_TEXT
 from tabris_slack_utils import ARTIFACT_MAX_BYTES_PER_FILE
 from tabris_slack_utils import ARTIFACT_MAX_FILES
 from tabris_slack_utils import ARTIFACT_MAX_TOTAL_BYTES
+from tabris_slack_utils import THREAD_ATTACHMENTS_LIST_MAX
 from tabris_slack_utils import WORKSPACE_INPUT_SUBDIR
 from tabris_slack_utils import _sanitize_slack_attachment_filename
+from tabris_slack_utils import _slack_private_file_url
 from tabris_slack_utils import decode_cancel_value
 
 sys.path.append('/etc/tabris')
@@ -65,17 +67,25 @@ def build_context(messages: list, is_dm: bool) -> str:
     lines = []
     for msg in messages:
         text = msg.get('text', '').strip()
-        if not text:
-            continue
+        files = msg.get('files') or []
 
-        is_bot_msg = bool(msg.get('bot_id'))
+        is_bot_msg = bool(msg.get('bot_id')) or msg.get('user') == BOT_USER_ID
         is_mention = f'<@{BOT_USER_ID}>' in text
 
-        if is_dm or is_bot_msg or is_mention:
-            role = 'Assistant' if is_bot_msg else 'User'
-            clean_text = text.replace(f'<@{BOT_USER_ID}>', '').strip()
-            if clean_text:
-                lines.append(f'{role}: {clean_text}')
+        # 텍스트가 없고 파일만 있는 메시지도 첨부 표기를 위해 포함한다.
+        if not text and not files:
+            continue
+        if not (is_dm or is_bot_msg or is_mention):
+            continue
+
+        role = 'Assistant' if is_bot_msg else 'User'
+        clean_text = text.replace(f'<@{BOT_USER_ID}>', '').strip()
+        attach_names = [
+            _sanitize_slack_attachment_filename(str(f.get('name') or 'attached')) for f in files if isinstance(f, dict)
+        ]
+        attach_note = f' [첨부: {", ".join(attach_names)}]' if attach_names else ''
+        if clean_text or attach_note:
+            lines.append(f'{role}: {clean_text}{attach_note}'.rstrip())
 
     return '\n'.join(lines)
 
@@ -221,44 +231,6 @@ def _post_access_denied(client, channel: str, thread_ts: str, text: str) -> None
         logger.exception('Failed to post access denied message')
 
 
-def _slack_private_file_url(file_obj: dict) -> str | None:
-    """Slack file 객체에서 Bot 토큰으로 GET 가능한 비공개 URL을 고른다."""
-
-    return file_obj.get('url_private_download') or file_obj.get('url_private')
-
-
-def _read_slack_private_url(url: str, bot_token: str, max_bytes: int) -> bytes | None:
-    """Slack `url_private*` GET. `max_bytes`를 넘기면 None."""
-
-    req = urllib.request.Request(
-        url,
-        headers={'Authorization': f'Bearer {bot_token}'},
-        method='GET',
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            cl = resp.headers.get('Content-Length')
-            if cl is not None:
-                try:
-                    if int(cl) > max_bytes:
-                        logger.warning(
-                            'Skipping Slack attachment: Content-Length %s exceeds %d',
-                            cl,
-                            max_bytes,
-                        )
-                        return None
-                except ValueError:
-                    pass
-            data = resp.read(max_bytes + 1)
-    except (OSError, urllib.error.HTTPError, urllib.error.URLError) as exc:
-        logger.warning('Slack attachment download failed: %s', exc, exc_info=True)
-        return None
-    if len(data) > max_bytes:
-        logger.warning('Slack attachment exceeds max_bytes after read')
-        return None
-    return data
-
-
 def _fargate_job_id(thread_ts: str, msg_id: str) -> str:
     """thread_ts + msg_id로부터 Fargate 잡 식별자를 만든다(로그·이벤트 상관용)."""
     return f'{thread_ts}-{msg_id}'.replace('.', '-')
@@ -289,9 +261,7 @@ def _aws_creds_env(creds: dict) -> dict:
 def _s3_put_bytes(bucket: str, key: str, body: bytes, creds: dict) -> None:
     """aws CLI로 객체 하나를 업로드한다(boto3 미사용). stdin 파이프로 임시파일 없이 처리."""
     cmd = [_aws_cli_executable(), 's3', 'cp', '-', f's3://{bucket}/{key}', '--only-show-errors']
-    result = subprocess.run(
-        cmd, input=body, env=_aws_creds_env(creds), capture_output=True, timeout=120, check=False
-    )
+    result = subprocess.run(cmd, input=body, env=_aws_creds_env(creds), capture_output=True, timeout=120, check=False)
     if result.returncode != 0:
         raise RuntimeError(f's3 cp 실패(s3://{bucket}/{key}): {result.stderr.decode("utf-8", "replace")[:300]}')
 
@@ -299,15 +269,19 @@ def _s3_put_bytes(bucket: str, key: str, body: bytes, creds: dict) -> None:
 def _ecs_stop_task(task_arn: str, reason: str, creds: dict) -> bool:
     """aws CLI로 ECS StopTask를 호출한다(취소). 성공 여부를 반환한다."""
     cmd = [
-        _aws_cli_executable(), 'ecs', 'stop-task',
-        '--cluster', ECS_CLUSTER,
-        '--task', task_arn,
-        '--reason', reason,
-        '--output', 'json',
+        _aws_cli_executable(),
+        'ecs',
+        'stop-task',
+        '--cluster',
+        ECS_CLUSTER,
+        '--task',
+        task_arn,
+        '--reason',
+        reason,
+        '--output',
+        'json',
     ]
-    result = subprocess.run(
-        cmd, env=_aws_creds_env(creds), capture_output=True, text=True, timeout=30, check=False
-    )
+    result = subprocess.run(cmd, env=_aws_creds_env(creds), capture_output=True, text=True, timeout=30, check=False)
     if result.returncode != 0:
         logger.error('ecs stop-task 실패(task=%s): %s', task_arn, result.stderr[:300])
         return False
@@ -321,16 +295,21 @@ def _sqs_send_message(queue_url: str, group_id: str, dedup_id: str, body: dict, 
     dedup_id: MessageDeduplicationId(job_id) — 5분 콘텐츠 중복 제거.
     """
     cmd = [
-        _aws_cli_executable(), 'sqs', 'send-message',
-        '--queue-url', queue_url,
-        '--message-group-id', group_id,
-        '--message-deduplication-id', dedup_id,
-        '--message-body', json.dumps(body),
-        '--output', 'json',
+        _aws_cli_executable(),
+        'sqs',
+        'send-message',
+        '--queue-url',
+        queue_url,
+        '--message-group-id',
+        group_id,
+        '--message-deduplication-id',
+        dedup_id,
+        '--message-body',
+        json.dumps(body),
+        '--output',
+        'json',
     ]
-    result = subprocess.run(
-        cmd, env=_aws_creds_env(creds), capture_output=True, text=True, timeout=30, check=False
-    )
+    result = subprocess.run(cmd, env=_aws_creds_env(creds), capture_output=True, text=True, timeout=30, check=False)
     if result.returncode != 0:
         raise RuntimeError(f'sqs send-message 실패: {result.stderr[:300]}')
     return json.loads(result.stdout or '{}')
@@ -341,22 +320,20 @@ def _put_cancel_marker(job_id: str, creds: dict) -> None:
     _s3_put_bytes(WORKSPACE_S3_BUCKET, f'jobs/{job_id}/cancel', b'', creds)
 
 
-def _upload_slack_files_to_s3(event: dict, thread_ts: str) -> list[dict]:
-    """트리거 메시지 첨부를 S3 `runs/{thread_ts}/input/`에 올린다.
+def _collect_current_message_files(event: dict) -> list[dict]:
+    """트리거 메시지 첨부의 메타데이터를 수집한다(다운로드·S3 업로드 없음).
 
-    반환: [{'filename': '<name>', 's3_key': 'runs/.../input/<name>'}] 목록.
-    Fargate 샌드박스가 이 목록으로 `/workspace/input/`에 내려받는다.
+    반환: [{'filename': '<name>', 'url': '<url_private*>', 'size': <bytes>}] 목록.
+    Fargate 워커가 이 목록으로 Slack에서 직접 받아 `/workspace/input/`에 둔다.
+    크기 검증은 Slack file 객체의 size 메타로 사전 컷하고, 실측 컷은 워커가 한다.
     """
     files = event.get('files') or []
-    if not files:
-        return []
 
-    creds = _resolve_aws_credentials()
-    uploaded: list[dict] = []
+    collected: list[dict] = []
     used_names: set[str] = set()
     total_bytes = 0
     for file_obj in files:
-        if len(uploaded) >= ARTIFACT_MAX_FILES:
+        if len(collected) >= ARTIFACT_MAX_FILES:
             logger.warning('Slack input files: max file count %d reached', ARTIFACT_MAX_FILES)
             break
         if not isinstance(file_obj, dict):
@@ -365,10 +342,11 @@ def _upload_slack_files_to_s3(event: dict, thread_ts: str) -> list[dict]:
         if not url:
             logger.warning('Slack file object has no private URL; skipping id=%r', file_obj.get('id'))
             continue
-        blob = _read_slack_private_url(url, SLACK_BOT_TOKEN, ARTIFACT_MAX_BYTES_PER_FILE)
-        if not blob:
+        size = int(file_obj.get('size') or 0)
+        if size > ARTIFACT_MAX_BYTES_PER_FILE:
+            logger.warning('Slack input files: size %d over per-file limit; skip id=%r', size, file_obj.get('id'))
             continue
-        if total_bytes + len(blob) > ARTIFACT_MAX_TOTAL_BYTES:
+        if total_bytes + size > ARTIFACT_MAX_TOTAL_BYTES:
             logger.warning('Slack input files: total byte limit %d reached', ARTIFACT_MAX_TOTAL_BYTES)
             break
         base = _sanitize_slack_attachment_filename(str(file_obj.get('name') or 'attached'))
@@ -379,16 +357,49 @@ def _upload_slack_files_to_s3(event: dict, thread_ts: str) -> list[dict]:
             candidate = f'{root}_{n}{ext}'
             n += 1
         used_names.add(candidate)
-        s3_key = f'runs/{thread_ts}/input/{candidate}'
-        try:
-            _s3_put_bytes(WORKSPACE_S3_BUCKET, s3_key, blob, creds)
-        except Exception:
-            logger.warning('Failed to upload Slack input file to S3: %s', s3_key, exc_info=True)
-            continue
-        total_bytes += len(blob)
-        uploaded.append({'filename': candidate, 's3_key': s3_key})
+        total_bytes += size
+        collected.append({'filename': candidate, 'url': url, 'size': size})
 
-    return uploaded
+    return collected
+
+
+def _collect_thread_attachments(messages: list, exclude_file_ids: set[str]) -> tuple[list[dict], bool]:
+    """스레드 히스토리의 첨부 메타데이터를 모은다(멘션 여부 무관, 봇 출력물 포함).
+
+    file id로 dedupe하고, 현재 메시지 첨부(exclude_file_ids — 이미 eager로 내려감)는 제외한다.
+    반환: ([{'name', 'size', 'mimetype', 'source', 'msg_ts', 'url'}], truncated 여부).
+    개수가 THREAD_ATTACHMENTS_LIST_MAX를 넘으면 최근 것 우선으로 자른다.
+    """
+    seen_ids: set[str] = set(exclude_file_ids)
+    attachments: list[dict] = []
+    for msg in messages:
+        is_bot_msg = bool(msg.get('bot_id')) or msg.get('user') == BOT_USER_ID
+        for file_obj in msg.get('files') or []:
+            if not isinstance(file_obj, dict):
+                continue
+            file_id = file_obj.get('id')
+            if not file_id or file_id in seen_ids:
+                continue
+            url = _slack_private_file_url(file_obj)
+            if not url:
+                # 삭제된 파일(tombstone)·접근 제한 파일은 url_private*가 없다.
+                continue
+            seen_ids.add(file_id)
+            attachments.append(
+                {
+                    'name': _sanitize_slack_attachment_filename(str(file_obj.get('name') or 'attached')),
+                    'size': int(file_obj.get('size') or 0),
+                    'mimetype': str(file_obj.get('mimetype') or ''),
+                    'source': 'Assistant' if is_bot_msg else 'User',
+                    'msg_ts': str(msg.get('ts') or ''),
+                    'url': url,
+                }
+            )
+
+    truncated = len(attachments) > THREAD_ATTACHMENTS_LIST_MAX
+    if truncated:
+        attachments = attachments[-THREAD_ATTACHMENTS_LIST_MAX:]
+    return attachments, truncated
 
 
 def _enqueue_claude_job(
@@ -418,6 +429,7 @@ def _enqueue_claude_job(
         'user_id': slack_user_id,
         'is_dm': _is_dm_channel(event),
         'prompt_s3_key': prompt_key,
+        # [{filename, url, size}] — 워커가 Slack에서 직접 받아 /workspace/input/에 둔다.
         'input_files': slack_input_files,
         # 봇이 메시지를 받은 시점(epoch). 워커는 이 값 기준으로 총 실행 시간을 계산한다.
         'request_epoch': round(received_at, 3),
@@ -534,8 +546,40 @@ def _aws_cli_executable() -> str:
     return '/usr/bin/aws'
 
 
-def _build_prompt(input_relpaths: list[str], context: str, request: str) -> str:
-    """첨부 안내 + 이전 대화 + 현재 요청을 합쳐 claude 프롬프트를 만든다(docker·fargate 공용)."""
+def _build_thread_attachments_note(attachments: list[dict], truncated: bool) -> str:
+    """스레드의 과거 첨부 목록을 프롬프트 섹션으로 렌더한다(필요할 때만 lazy 다운로드 안내)."""
+    if not attachments:
+        return ''
+    header = (
+        '## 스레드의 과거 첨부\n'
+        '아래는 이 스레드의 이전 메시지에 올라온 파일들이다(이번 메시지 첨부는 위 `/workspace/input/`에 이미 있음). '
+        '필요한 것만 아래 명령으로 `/tmp`에 받아 활용할 것:\n'
+        '`python ~/.claude/skills/slack_fetch/scripts/download_files.py '
+        "--token $SLACK_BOT_TOKEN --url '<url>' --name '<name>' --output-dir /tmp`\n"
+        '받으려는 파일이 404 등으로 실패하면 사용자에게 해당 파일을 다시 올려달라고 안내할 것.\n'
+    )
+    rows = []
+    for a in attachments:
+        meta = ' / '.join(
+            filter(
+                None,
+                [
+                    f'출처: {a["source"]}',
+                    f'{a["size"]} bytes' if a.get('size') else '',
+                    a.get('mimetype') or '',
+                    f'ts={a["msg_ts"]}' if a.get('msg_ts') else '',
+                ],
+            )
+        )
+        rows.append(f"- `{a['name']}` ({meta})\n  url: '{a['url']}'")
+    note = header + '\n'.join(rows) + '\n'
+    if truncated:
+        note += f'(오래된 첨부 일부는 생략됨 — 최근 {THREAD_ATTACHMENTS_LIST_MAX}개만 표시)\n'
+    return note + '\n'
+
+
+def _build_prompt(input_relpaths: list[str], thread_attachments_note: str, context: str, request: str) -> str:
+    """첨부 안내 + 스레드 과거 첨부 + 이전 대화 + 현재 요청을 합쳐 claude 프롬프트를 만든다."""
     if input_relpaths:
         lines = '\n'.join(f'- `/workspace/{p}`' for p in input_relpaths)
         input_note = (
@@ -546,27 +590,52 @@ def _build_prompt(input_relpaths: list[str], context: str, request: str) -> str:
         )
     else:
         input_note = ''
+    prefix = input_note + thread_attachments_note
     if context:
-        return f'{input_note}## 이전 대화\n{context}\n\n## 현재 요청\n{request}'
-    return f'{input_note}## 현재 요청\n{request}'
+        return f'{prefix}## 이전 대화\n{context}\n\n## 현재 요청\n{request}'
+    return f'{prefix}## 현재 요청\n{request}'
 
 
-def _prepare_prompt(client, event, channel, thread_ts, is_dm, user_request):
-    """첨부 S3 업로드 + 스레드 히스토리 + 현재 요청을 합쳐 (prompt, slack_input_files)를 만든다.
+def _prepare_prompt(client, event, channel, thread_ts, is_dm, user_request, waiting_msg_ts):
+    """현재 첨부 메타 수집 + 스레드 히스토리/과거 첨부 + 현재 요청을 합쳐 (prompt, slack_input_files)를 만든다.
 
-    워밍 풀·1회용 두 디스패치 경로의 공용 전처리.
+    스레드 replies는 1회만 fetch해 이전 대화 context와 과거 첨부 목록 양쪽에 쓴다.
     """
-    slack_input_files = _upload_slack_files_to_s3(event, thread_ts)
+    slack_input_files = _collect_current_message_files(event)
     input_relpaths = [f'{WORKSPACE_INPUT_SUBDIR}/{f["filename"]}' for f in slack_input_files]
+    current_file_ids = {f.get('id') for f in (event.get('files') or []) if isinstance(f, dict) and f.get('id')}
+
+    all_msgs = _fetch_thread_messages(client, channel, thread_ts)
+    # 트리거 메시지·대기 메시지는 "이전 대화"에서 제외한다(현재 요청과 중복 방지).
+    trigger_ts = event.get('ts')
+    exclude_ts = {ts for ts in (trigger_ts, waiting_msg_ts) if ts}
+    history_msgs = [m for m in all_msgs if m.get('ts') not in exclude_ts]
+
+    context = build_context(history_msgs, is_dm)
+    attachments, truncated = _collect_thread_attachments(history_msgs, current_file_ids)
+    thread_attachments_note = _build_thread_attachments_note(attachments, truncated)
+    prompt = _build_prompt(input_relpaths, thread_attachments_note, context, user_request)
+    return prompt, slack_input_files
+
+
+def _fetch_thread_messages(client, channel: str, thread_ts: str) -> list[dict]:
+    """스레드 전체 메시지를 cursor 페이지네이션으로 모은다. 실패 시 빈 리스트."""
+    messages: list[dict] = []
+    cursor = None
     try:
-        replies = client.conversations_replies(channel=channel, ts=thread_ts)
-        history_msgs = replies.get('messages', [])[:-1]
+        while True:
+            kwargs = {'channel': channel, 'ts': thread_ts, 'limit': 200}
+            if cursor:
+                kwargs['cursor'] = cursor
+            replies = client.conversations_replies(**kwargs)
+            messages.extend(replies.get('messages', []) or [])
+            cursor = (replies.get('response_metadata') or {}).get('next_cursor') or ''
+            if not cursor:
+                break
     except Exception:
         logger.warning('Failed to fetch thread history', exc_info=True)
-        history_msgs = []
-    context = build_context(history_msgs, is_dm)
-    prompt = _build_prompt(input_relpaths, context, user_request)
-    return prompt, slack_input_files
+        return messages
+    return messages
 
 
 def _handle_request_pool(event, client, channel, thread_ts, is_dm, user_request, received_at):
@@ -578,14 +647,14 @@ def _handle_request_pool(event, client, channel, thread_ts, is_dm, user_request,
     initial_text = '⏳ 접수됨 — 작업 처리 대기중입니다…'
     waiting_msg = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=initial_text)
     try:
-        prompt, slack_input_files = _prepare_prompt(client, event, channel, thread_ts, is_dm, user_request)
+        prompt, slack_input_files = _prepare_prompt(
+            client, event, channel, thread_ts, is_dm, user_request, waiting_msg['ts']
+        )
         _enqueue_claude_job(event, prompt, thread_ts, waiting_msg['ts'], slack_input_files, received_at)
     except Exception as exc:
         logger.exception('Failed to enqueue job to SQS')
         try:
-            client.chat_update(
-                channel=channel, ts=waiting_msg['ts'], text=f'⚠️ 작업 접수 실패: {exc}', blocks=[]
-            )
+            client.chat_update(channel=channel, ts=waiting_msg['ts'], text=f'⚠️ 작업 접수 실패: {exc}', blocks=[])
         except Exception:
             logger.warning('Failed to update waiting message after enqueue error', exc_info=True)
 

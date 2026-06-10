@@ -4,7 +4,7 @@
 #
 # 생성 대상:
 #   - ECR 이미지 (hbsmith/tabris:latest, ARM64)  ※ 공유 계정(591379657681) repo에 cross-account push
-#   - S3 workspace 버킷 (prompt/input/cancel, lifecycle 1일)
+#   - S3 workspace 버킷 (prompt/cancel 마커, lifecycle 1일)
 #   - IAM: task role + execution role
 #   - CloudWatch Logs 그룹
 #   - ECS 클러스터 (FARGATE) + 워밍 풀 서비스/오토스케일
@@ -273,7 +273,7 @@ if [[ "${WORKSPACE_BUCKET_OWNED}" == "1" ]]; then
   aws s3api put-public-access-block --bucket "${WORKSPACE_BUCKET}" \
     --public-access-block-configuration \
     "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
-  # lifecycle: runs/*(prompt·input)와 jobs/*(done·cancel 멱등 마커)를 1일 후 만료(코드 없는 청소).
+  # lifecycle: runs/*(prompt)와 jobs/*(done·cancel 멱등 마커)를 1일 후 만료(코드 없는 청소).
   aws s3api put-bucket-lifecycle-configuration --bucket "${WORKSPACE_BUCKET}" \
     --lifecycle-configuration '{
       "Rules": [
@@ -662,7 +662,7 @@ SQS_QUEUE_URL = '${QUEUE_URL}'
 
 ※ 봇 EB role(${BOT_ROLE_NAME})에는 본 스크립트가 디스패치 권한(tabris-bot-dispatch)을 부착했습니다:
      - sqs:SendMessage  → ${QUEUE_NAME}
-     - s3:PutObject     → ${WORKSPACE_BUCKET}/jobs/* (cancel 마커), runs/* (prompt/input)
+     - s3:PutObject     → ${WORKSPACE_BUCKET}/jobs/* (cancel 마커), runs/* (prompt)
      - ecs:StopTask     → cluster ${CLUSTER}
    워커(task role)에는 SQS receive/delete/visibility 권한을 부여했습니다.
 ────────────────────────────────────────────────────────────────────

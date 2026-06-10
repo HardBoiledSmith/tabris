@@ -254,9 +254,10 @@ def test_thread_history_is_included_in_prompt(run_server_module, slack_client, d
     """스레드 이전 대화가 디스패치되는 프롬프트에 포함되고 현재 메시지는 제외된다."""
     slack_client.conversations_replies.return_value = {
         'messages': [
-            {'text': 'earlier user question', 'user': 'U_USER'},
-            {'text': 'earlier bot answer', 'bot_id': 'B1'},
-            {'text': 'current message — should be excluded', 'user': 'U_USER'},
+            {'text': 'earlier user question', 'user': 'U_USER', 'ts': '1699999999.000001'},
+            {'text': 'earlier bot answer', 'bot_id': 'B1', 'ts': '1699999999.000002'},
+            # 트리거 메시지(이벤트 ts와 동일) → 이전 대화에서 제외돼야 한다.
+            {'text': 'current message — should be excluded', 'user': 'U_USER', 'ts': '1700000000.000001'},
         ]
     }
 
