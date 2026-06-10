@@ -153,8 +153,12 @@ def _sqs_delete(queue_url: str, receipt: str) -> None:
 
 
 def _sqs_change_visibility(queue_url: str, receipt: str, timeout: int) -> None:
-    """처리 중 메시지의 visibility를 연장한다(하트비트). 실패해도 본 흐름엔 영향 없다."""
-    subprocess.run(
+    """처리 중 메시지의 visibility를 연장한다(하트비트). 실패해도 본 흐름엔 영향 없다.
+
+    receipt이 이미 만료(visibility 한 번 풀려 재배달)됐으면 change-message-visibility가 실패하는데,
+    이는 곧 중복 처리가 진행 중이라는 신호이므로 조용히 넘기지 않고 경고로 남긴다.
+    """
+    result = subprocess.run(
         [
             _aws_cli(), 'sqs', 'change-message-visibility',
             '--queue-url', queue_url,
@@ -162,9 +166,36 @@ def _sqs_change_visibility(queue_url: str, receipt: str, timeout: int) -> None:
             '--visibility-timeout', str(timeout),
         ],
         capture_output=True,
+        text=True,
         timeout=30,
         check=False,
     )
+    if result.returncode != 0:
+        logger.warning('SQS visibility 연장 실패(재배달 위험): %s', (result.stderr or '').strip()[:200])
+
+
+def _start_visibility_heartbeat(queue_url: str, receipt: str) -> tuple[threading.Thread, threading.Event]:
+    """잡 처리 전 구간 동안 SQS visibility를 주기적으로 연장하는 백그라운드 스레드를 띄운다.
+
+    run_claude_direct 내부의 진행 콜백만으로는 다운로드/메모리 동기화/산출물 업로드 구간이
+    무방비라, 그 사이 visibility(SQS_VISIBILITY_TIMEOUT_SEC)가 만료돼 다른 워커가 같은 잡을
+    재수신(중복 실행)할 수 있다. 이 스레드가 수신~삭제 직전까지의 전 구간을 덮는다.
+
+    반환: (thread, stop_event). 호출부는 처리 종료 시 stop_event.set() 후 join 해야 한다.
+    """
+    stop = threading.Event()
+
+    def _run() -> None:
+        # 첫 연장은 한 주기 뒤. 수신 시 설정된 visibility(SQS_VISIBILITY_TIMEOUT_SEC)가 그 사이를 덮는다.
+        while not stop.wait(PROGRESS_INTERVAL_SEC):
+            try:
+                _sqs_change_visibility(queue_url, receipt, SQS_VISIBILITY_TIMEOUT_SEC)
+            except Exception:
+                logger.warning('백그라운드 하트비트 실패', exc_info=True)
+
+    thread = threading.Thread(target=_run, name='sqs-visibility-heartbeat', daemon=True)
+    thread.start()
+    return thread, stop
 
 
 # ---------------------------------------------------------------------------
@@ -573,16 +604,19 @@ def main_loop() -> None:
             _sqs_delete(queue_url, receipt)
             continue
 
-        def _heartbeat(_receipt=receipt) -> None:
-            _sqs_change_visibility(queue_url, _receipt, SQS_VISIBILITY_TIMEOUT_SEC)
-
+        # 수신~삭제 직전까지 전 구간 visibility를 백그라운드로 연장한다(다운로드/메모리 동기화/
+        # 산출물 업로드 등 run_claude_direct 밖 구간의 중복 재배달 방지).
+        hb_thread, hb_stop = _start_visibility_heartbeat(queue_url, receipt)
         try:
             reset_workspace()
-            process_job(job, heartbeat=_heartbeat, task_arn=task_arn)
+            process_job(job, task_arn=task_arn)
         except Exception:
             # 인프라성 예외(S3/네트워크 등) — 삭제하지 않아 visibility 만료 후 재배달=재시도.
             logger.exception('job %s 처리 실패 — 메시지 보존(재배달).', job_id)
             continue
+        finally:
+            hb_stop.set()
+            hb_thread.join(timeout=5)
 
         # 정상 반환(성공/claude 에러 메시지 게시 포함) → done 마커 후 삭제.
         _put_marker(job_id, 'done')
