@@ -383,9 +383,39 @@ def _format_duration(seconds: int) -> str:
     return f'{s}초'
 
 
-def _progress_waiting_text(elapsed_sec: int, timeout_sec: int) -> str:
-    """Claude 실행 중 Slack 대기 메시지: 경과/최대 대기(분초)."""
-    return f'⏳ 처리 중… ({_format_duration(elapsed_sec)} / {_format_duration(timeout_sec)})'
+def _progress_waiting_text(elapsed_sec: int, timeout_sec: int, model: str | None = None) -> str:
+    """Claude 실행 중 Slack 대기 메시지: 경과/최대 대기(분초) + (있으면) 수행 모델."""
+    text = f'⏳ 처리 중… ({_format_duration(elapsed_sec)} / {_format_duration(timeout_sec)})'
+    if model:
+        text += f' · 🤖 {model}'
+    return text
+
+
+def _format_usd(cost: float) -> str:
+    """USD 비용 표기. 1달러 미만의 소액(토큰 비용 대부분)은 4자리, 이상은 2자리 소수."""
+    return f'${cost:.2f}' if cost >= 1 else f'${cost:.4f}'
+
+
+def _build_result_meta_text(elapsed_sec: int, usage: dict | None) -> str:
+    """결과 메시지 하단 context 텍스트: 실행 시간 + (있으면) 실제 모델·토큰·비용.
+
+    usage는 sandbox_worker가 claude CLI JSON에서 파싱한
+    {model, total_cost_usd, input_tokens, output_tokens}. 누락 필드는 항목째 생략한다.
+    """
+    parts = [f'⏱️ 실행 시간: {_format_duration(elapsed_sec)}']
+    u = usage or {}
+    if u.get('model'):
+        parts.append(f'🤖 {u["model"]}')
+    tokens = [
+        f'{label} {u[key]:,}'
+        for label, key in (('입력', 'input_tokens'), ('출력', 'output_tokens'))
+        if u.get(key) is not None
+    ]
+    if tokens:
+        parts.append(f'🔢 토큰: {" / ".join(tokens)}')
+    if u.get('total_cost_usd') is not None:
+        parts.append(f'💰 {_format_usd(u["total_cost_usd"])}')
+    return ' · '.join(parts)
 
 
 def encode_cancel_value(task_arn: str | None, job_id: str | None) -> str:

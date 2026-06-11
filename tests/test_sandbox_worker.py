@@ -9,6 +9,9 @@ import json
 from unittest.mock import MagicMock
 
 import sandbox_worker
+from tabris_slack_utils import _build_result_meta_text
+from tabris_slack_utils import _format_usd
+from tabris_slack_utils import _progress_waiting_text
 from tests.helpers import install_claude_popen_mock
 
 
@@ -149,6 +152,85 @@ def test_download_input_files_continues_on_failure(monkeypatch, tmp_path):
     )
 
     assert saved == ['good.txt']
+
+
+def test_progress_waiting_text_includes_model():
+    """시작/진행 메시지에 수행 모델을 표기한다."""
+    text = _progress_waiting_text(0, 1800, model='claude-opus-4-8')
+    assert 'claude-opus-4-8' in text
+    assert '처리 중' in text
+    # 모델 미지정(기존 호출) 시엔 기존 포맷 그대로.
+    assert '🤖' not in _progress_waiting_text(0, 1800)
+
+
+def test_format_usd():
+    assert _format_usd(0.0123) == '$0.0123'
+    assert _format_usd(0.00005) == '$0.0001'
+    assert _format_usd(1.5) == '$1.50'
+    assert _format_usd(12.345) == '$12.35'
+
+
+def test_build_result_meta_text_full():
+    """실행 시간 · 실제 모델 · 토큰(천단위) · 비용을 모두 표기한다."""
+    text = _build_result_meta_text(
+        83,
+        {'model': 'claude-opus-4-8[1m]', 'total_cost_usd': 0.0123, 'input_tokens': 12345, 'output_tokens': 678},
+    )
+    assert text == '⏱️ 실행 시간: 1분 23초 · 🤖 claude-opus-4-8[1m] · 🔢 토큰: 입력 12,345 / 출력 678 · 💰 $0.0123'
+
+
+def test_build_result_meta_text_without_usage_keeps_elapsed_only():
+    """usage 파싱 실패(None) 시에도 실행 시간은 남는다."""
+    assert _build_result_meta_text(5, None) == '⏱️ 실행 시간: 5초'
+
+
+def test_process_job_posts_usage_suffix(monkeypatch):
+    """완료 시 결과 메시지 suffix에 모델·토큰·비용 context 블록을 붙인다."""
+    monkeypatch.setenv('SLACK_BOT_TOKEN', 'xoxb-test')
+    job = {
+        'job_id': 'job-1',
+        'channel': 'D1',
+        'thread_ts': '1700000000.000001',
+        'waiting_msg_ts': '1700000000.000100',
+        'user_id': 'U1',
+        'prompt_s3_key': 'runs/x/prompt.txt',
+        'input_files': [],
+    }
+
+    monkeypatch.setattr(sandbox_worker, 'WebClient', lambda token: MagicMock())
+    monkeypatch.setattr(sandbox_worker.os, 'makedirs', lambda *a, **k: None)
+    monkeypatch.setattr(sandbox_worker, 'download_prompt_from_s3', lambda key: 'p')
+    monkeypatch.setattr(sandbox_worker, 'download_input_files', lambda files: [])
+    monkeypatch.setattr(sandbox_worker, 'sync_memory_from_s3', lambda user: None)
+    monkeypatch.setattr(sandbox_worker, 'sync_memory_to_s3', lambda user: None)
+    monkeypatch.setattr(sandbox_worker, '_self_task_arn', lambda: None)
+    monkeypatch.setattr(sandbox_worker, 'post_workspace_artifacts_to_thread', lambda *a, **k: None)
+    monkeypatch.setattr(
+        sandbox_worker,
+        'run_claude_direct',
+        lambda *a, **k: (
+            0,
+            'answer',
+            {'model': 'claude-opus-4-8[1m]', 'total_cost_usd': 0.0123, 'input_tokens': 12345, 'output_tokens': 678},
+        ),
+    )
+
+    captured = {}
+
+    def fake_post(slack, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(sandbox_worker, 'post_claude_markdown_to_thread', fake_post)
+
+    sandbox_worker.process_job(job)
+
+    suffix = captured['suffix_blocks']
+    assert suffix and suffix[0]['type'] == 'context'
+    meta_text = suffix[0]['elements'][0]['text']
+    assert 'claude-opus-4-8[1m]' in meta_text
+    assert '12,345' in meta_text
+    assert '$0.0123' in meta_text
+    assert '실행 시간' in meta_text
 
 
 def test_process_job_emits_request_and_response_events(monkeypatch, event_log_lines):

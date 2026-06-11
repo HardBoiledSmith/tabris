@@ -35,7 +35,7 @@ from slack_sdk import WebClient
 from tabris_slack_utils import ARTIFACT_MAX_BYTES_PER_FILE
 from tabris_slack_utils import WORKSPACE_INPUT_SUBDIR
 from tabris_slack_utils import _build_cancel_blocks
-from tabris_slack_utils import _format_duration
+from tabris_slack_utils import _build_result_meta_text
 from tabris_slack_utils import _progress_waiting_text
 from tabris_slack_utils import _read_slack_private_url
 from tabris_slack_utils import _sanitize_slack_attachment_filename
@@ -422,7 +422,7 @@ def run_claude_direct(prompt: str, progress_callback) -> tuple[int, str, dict | 
         now = time.time()
         elapsed = int(now - started_at)
         if progress_callback and now - last_progress_at >= PROGRESS_INTERVAL_SEC:
-            progress_callback(_progress_waiting_text(elapsed, CLAUDE_TIMEOUT))
+            progress_callback(_progress_waiting_text(elapsed, CLAUDE_TIMEOUT, model=CLAUDE_MODEL))
             last_progress_at = now
 
         if process.poll() is not None and output_queue.empty():
@@ -510,7 +510,7 @@ def process_job(job: dict, *, heartbeat=None, task_arn: str | None = None) -> No
     # 봇은 취소 버튼을 달지 못한다(어느 워커가 집을지 미정). 워커가 시작 즉시 한 번
     # 진행 메시지를 갱신해 자기 task ARN으로 취소 버튼을 노출한다.
     if cancel_value:
-        _progress_callback(_progress_waiting_text(0, CLAUDE_TIMEOUT))
+        _progress_callback(_progress_waiting_text(0, CLAUDE_TIMEOUT, model=CLAUDE_MODEL))
 
     _log_event_json(
         {
@@ -539,16 +539,17 @@ def process_job(job: dict, *, heartbeat=None, task_arn: str | None = None) -> No
         return
 
     elapsed_sec = int(time.time() - run_start)
-    elapsed_display = _format_duration(elapsed_sec)
     elapsed_suffix = None
     if returncode == 0:
+        u = usage or {}
+        # 실제 사용 모델(modelUsage 기준)이 없으면 요청 모델로 폴백해 표기한다.
+        meta_text = _build_result_meta_text(elapsed_sec, {**u, 'model': u.get('model') or CLAUDE_MODEL})
         elapsed_suffix = [
             {
                 'type': 'context',
-                'elements': [{'type': 'mrkdwn', 'text': f'⏱️ 실행 시간: {elapsed_display}'}],
+                'elements': [{'type': 'mrkdwn', 'text': meta_text}],
             }
         ]
-        u = usage or {}
         _log_event_json(
             {
                 'evt': 'response',
